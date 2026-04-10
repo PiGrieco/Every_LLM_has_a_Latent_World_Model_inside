@@ -18,6 +18,7 @@ Output:
 import os
 import sys
 import json
+import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -25,8 +26,25 @@ from scripts.train import run_d0, run_d1, set_seed
 from src.config import Config
 
 
+def _gpu_defaults():
+    """Return (batch_size, n_trajectories) scaled for the available GPU."""
+    if torch.cuda.is_available():
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+        if gpu_mem_gb > 20:
+            return 2048, 5000
+    return 128, 1000
+
+
 def main():
     all_results = {}
+    batch_size, n_traj = _gpu_defaults()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cuda":
+        print(f"GPU: {torch.cuda.get_device_name()} | batch_size={batch_size} | n_traj={n_traj}")
 
     geometries = ["lorentzian", "riemannian", "euclidean"]
 
@@ -41,9 +59,11 @@ def main():
         cfg = Config(
             dataset="d0_synthetic",
             geometry=geo,
+            device=device,
             latent_dim=16,
-            n_trajectories=1000,
+            n_trajectories=n_traj,
             trajectory_length=50,
+            batch_size=batch_size,
             stage2_epochs=50,
             stage3_epochs=100,
             output_dir=f"./outputs/d0",
@@ -71,11 +91,13 @@ def main():
         cfg = Config(
             dataset="d1_branching",
             geometry=geo,
+            device=device,
             latent_dim=16,
-            n_trajectories=500,
+            n_trajectories=max(n_traj, 500),
             prefix_length=10,
             n_branches=4,
             branch_length=20,
+            batch_size=batch_size,
             stage2_epochs=50,
             stage3_epochs=100,
             output_dir=f"./outputs/d1",

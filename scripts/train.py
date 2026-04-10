@@ -317,7 +317,21 @@ def main():
     # Set device
     if torch.cuda.is_available():
         cfg.device = "cuda"
-        print(f"Using GPU: {torch.cuda.get_device_name()}")
+        gpu_name = torch.cuda.get_device_name()
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        print(f"Using GPU: {gpu_name} ({gpu_mem_gb:.1f} GB)")
+
+        # Enable TF32 for Ampere+ GPUs (free ~2-3x speedup on matmuls)
+        torch.set_float32_matmul_precision("high")
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.backends.cudnn.benchmark = True
+
+        # Auto-scale batch size for large GPUs on synthetic datasets
+        if cfg.dataset in ("d0_synthetic", "d1_branching") and gpu_mem_gb > 20:
+            cfg.batch_size = max(cfg.batch_size, 2048)
+            cfg.n_trajectories = max(cfg.n_trajectories, 5000)
+            print(f"  Auto-scaled: batch_size={cfg.batch_size}, n_trajectories={cfg.n_trajectories}")
     else:
         cfg.device = "cpu"
         print("Using CPU (training will be slower)")
