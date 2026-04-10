@@ -59,7 +59,7 @@ Open a Colab notebook with **A100 GPU** runtime and run:
 !git clone https://github.com/PiGrieco/Every_LLM_has_a_Latent_World_Model_inside.git
 %cd Every_LLM_has_a_Latent_World_Model_inside
 !pip install -q torch transformers sentence-transformers datasets \
-    faiss-gpu matplotlib seaborn scikit-learn pyyaml tqdm umap-learn
+    faiss-cpu matplotlib seaborn scikit-learn pyyaml tqdm umap-learn
 
 # Cell 2 — D0 sanity check (< 5 min on A100)
 !python -m scripts.train --dataset d0_synthetic --geometry lorentzian \

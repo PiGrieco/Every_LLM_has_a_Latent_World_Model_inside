@@ -21,9 +21,9 @@ from ..models.metric import MetricNetwork
 from ..models.adapter import GeometryAdapter, IdentityAdapter
 from ..models.lagrangian import Lagrangian
 from ..models.world_model import ConditionalGaussianWorldModel
-from ..training.losses import compute_total_loss
+from ..training.losses import compute_total_loss, calibrate_loss_weights
 from ..training.candidates import build_candidate_set_c1, build_candidate_set_c2, build_faiss_index
-from ..training.losses import calibrate_loss_weights
+from ..evaluation.metrics import compute_all_metrics
 
 
 class WorldModelTrainer:

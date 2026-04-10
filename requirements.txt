@@ -11,7 +11,7 @@ sentence-transformers>=2.2.0
 datasets>=2.16.0    # HuggingFace datasets for WikiText-103
 
 # Nearest neighbors
-faiss-gpu>=1.7.4    # Use faiss-cpu if no GPU
+faiss-cpu>=1.7.4    # Use faiss-gpu if available; faiss-cpu works everywhere
 
 # Config and logging
 pyyaml>=6.0
