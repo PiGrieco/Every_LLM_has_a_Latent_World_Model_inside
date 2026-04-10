@@ -77,14 +77,17 @@ class WorldModelTrainer:
         ).to(self.device)
 
         # ---- Optimizer ----
-        all_params = (
+        # Deduplicate: lagrangian contains metric as a submodule, so
+        # collecting both would register metric params twice.
+        seen = {}
+        for p in (
             list(self.adapter.parameters())
-            + list(self.metric.parameters())
             + list(self.lagrangian.parameters())
             + list(self.world_model.parameters())
-        )
+        ):
+            seen[id(p)] = p
         self.optimizer = optim.AdamW(
-            all_params, lr=cfg.lr, weight_decay=cfg.weight_decay
+            list(seen.values()), lr=cfg.lr, weight_decay=cfg.weight_decay
         )
 
         # State
@@ -175,17 +178,19 @@ class WorldModelTrainer:
                 stage=stage,
             )
 
-            # Backward
+            # Backward (skip if no trainable parameter contributes to the loss,
+            # which happens for euclidean geometry + identity adapter in stage 2)
             self.optimizer.zero_grad()
-            losses["total"].backward()
-            if self.cfg.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    list(self.metric.parameters())
-                    + list(self.world_model.parameters())
-                    + list(self.adapter.parameters()),
-                    self.cfg.grad_clip,
-                )
-            self.optimizer.step()
+            if losses["total"].requires_grad:
+                losses["total"].backward()
+                if self.cfg.grad_clip > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        list(self.metric.parameters())
+                        + list(self.world_model.parameters())
+                        + list(self.adapter.parameters()),
+                        self.cfg.grad_clip,
+                    )
+                self.optimizer.step()
 
             # Accumulate losses
             for k, v in losses.items():

@@ -51,7 +51,11 @@ def main():
             seed=42,
         )
         set_seed(cfg.seed)
-        results = run_d0(cfg)
+        try:
+            results = run_d0(cfg)
+        except Exception as e:
+            print(f"  [ERROR] D0/{geo} failed: {e}")
+            results = {"error": str(e)}
         d0_results[geo] = results
 
     all_results["d0"] = d0_results
@@ -79,7 +83,11 @@ def main():
             seed=42,
         )
         set_seed(cfg.seed)
-        results = run_d1(cfg)
+        try:
+            results = run_d1(cfg)
+        except Exception as e:
+            print(f"  [ERROR] D1/{geo} failed: {e}")
+            results = {"error": str(e)}
         d1_results[geo] = results
 
     all_results["d1"] = d1_results
@@ -93,7 +101,10 @@ def main():
     print(f"{'Geometry':<15} {'M1 (timelike)':<18} {'M2 (action gap)':<18} {'M2 (logprob gap)':<18}")
     print("-" * 69)
     for geo in geometries:
-        r = d0_results[geo]
+        r = d0_results.get(geo, {})
+        if "error" in r:
+            print(f"{geo:<15} {'ERROR':<18} {r['error'][:36]}")
+            continue
         m1 = r.get("m1_timelike_rate", "N/A")
         m2a = r.get("m2_action_gap", "N/A")
         m2l = r.get("m2_logprob_gap", "N/A")
@@ -106,7 +117,10 @@ def main():
     print(f"{'Geometry':<15} {'M1 (timelike)':<18} {'M3 (branch sep)':<18}")
     print("-" * 51)
     for geo in geometries:
-        r = d1_results[geo]
+        r = d1_results.get(geo, {})
+        if "error" in r:
+            print(f"{geo:<15} {'ERROR':<18} {r['error'][:36]}")
+            continue
         m1 = r.get("m1_timelike_rate", "N/A")
         m3 = r.get("m3_branching_separation", "N/A")
         m1_s = f"{m1:.4f}" if isinstance(m1, float) else m1

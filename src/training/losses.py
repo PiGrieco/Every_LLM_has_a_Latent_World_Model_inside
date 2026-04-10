@@ -277,12 +277,18 @@ def calibrate_loss_weights(
         "match": l_match.item(),
     }
 
-    # Target: all losses contribute equally. Use geometric mean as reference.
-    vals = [v for v in magnitudes.values() if v > 1e-8]
-    if not vals:
+    # Only calibrate losses that are meaningfully above zero.
+    # A near-zero loss (e.g. l_time after stage 2 convergence) should keep
+    # its configured weight rather than receiving a blown-up coefficient.
+    active = {k: v for k, v in magnitudes.items() if v > 1e-4}
+    if len(active) < 2:
         return {"time": 1.0, "ml": 1.0, "match": 1.0}
 
-    ref = (torch.tensor(vals).prod() ** (1.0 / len(vals))).item()
-    weights = {k: ref / max(v, 1e-8) for k, v in magnitudes.items()}
-
+    ref = (torch.tensor(list(active.values())).prod() ** (1.0 / len(active))).item()
+    weights = {}
+    for k, v in magnitudes.items():
+        if v > 1e-4:
+            weights[k] = min(ref / v, 100.0)
+        else:
+            weights[k] = 1.0
     return weights
