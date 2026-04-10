@@ -14,38 +14,50 @@ import torch
 import torch.nn.functional as F
 from typing import Optional
 
+from ..models.time_orientation import TimeOrientation, future_loss
 
-def time_likeness_loss(
+
+def contrastive_cone_loss(
     metric,
     s: torch.Tensor,
     s_next: torch.Tensor,
-    margin: float = -0.1,
+    margin_inside: float = -0.1,
+    margin_outside: float = 0.1,
 ) -> torch.Tensor:
     """
-    L_time = E[max(0, Δs^T g_θ(s) Δs + ε)]
+    Contrastive cone loss: push real transitions INSIDE the cone (time-like)
+    and push negatives OUTSIDE the cone (space-like).
 
-    Penalizes transitions that are NOT time-like. A time-like transition
-    has Δσ² < 0 (negative squared interval). The margin ε < 0 enforces
-    a safety gap — we want Δσ² < ε, not just Δσ² < 0.
-
-    This is the key loss for H1: if it converges to near-zero, real
-    transitions are predominantly time-like under the learned metric.
+    This prevents the "cone collapse" problem where the metric learns a
+    degenerate cone that encompasses everything.
 
     Args:
         metric: MetricNetwork instance
         s: (batch, D) current states
-        s_next: (batch, D) next states
-        margin: negative margin ε (more negative = stricter)
+        s_next: (batch, D) true next states
+        margin_inside: negative margin for time-like constraint
+        margin_outside: positive margin for space-like constraint
 
     Returns:
-        loss: scalar, average hinge loss
+        loss: scalar, average contrastive cone loss
     """
-    delta_s = s_next - s
-    interval = metric.squared_interval(s, delta_s)  # (batch,)
-    # Hinge: max(0, interval + |margin|)
-    # If interval < -|margin|, loss = 0 (sufficiently time-like)
-    loss = F.relu(interval - margin).mean()
-    return loss
+    batch = s.shape[0]
+
+    delta_real = s_next - s
+    interval_real = metric.squared_interval(s, delta_real)
+    loss_inside = F.relu(interval_real - margin_inside).mean()
+
+    perm = torch.randperm(batch, device=s.device)
+    s_neg = s_next[perm]
+    same_mask = (perm == torch.arange(batch, device=s.device))
+    if same_mask.any():
+        s_neg[same_mask] = s_next[(perm[same_mask] + 1) % batch]
+
+    delta_neg = s_neg - s
+    interval_neg = metric.squared_interval(s, delta_neg)
+    loss_outside = F.relu(margin_outside - interval_neg).mean()
+
+    return loss_inside + loss_outside
 
 
 def smoothness_loss(
@@ -198,46 +210,53 @@ def compute_total_loss(
     cfg=None,
     stage: int = 2,
     dynamic_weights: Optional[dict] = None,
+    time_fn=None,
 ) -> dict:
     """
     Compute the total loss for a training step, respecting staged training.
 
-    Stage 2: L_time + L_cond
-    Stage 3: L_time + L_match + L_ML + L_smooth + L_cond
+    Stage 2: L_cone_contrastive + L_future + L_cond
+    Stage 3: L_cone_contrastive + L_future + L_match + L_ML + L_cond
 
-    Returns a dict with individual loss terms and the total.
+    The contrastive cone loss replaces the old one-sided time-likeness loss,
+    preventing cone collapse. The future loss (from τ_θ) breaks time-reversal
+    symmetry in the energy, making M2(action gap) a meaningful probe.
     """
     losses = {}
 
-    # Always: time-likeness
-    losses["time"] = time_likeness_loss(
+    losses["cone"] = contrastive_cone_loss(
         metric, s, s_next,
-        margin=cfg.causal_margin if cfg else -0.1,
+        margin_inside=cfg.causal_margin if cfg else -0.1,
+        margin_outside=cfg.cone_margin_outside if cfg else 0.1,
     )
 
-    # Always: condition number regularization
-    losses["cond"] = condition_number_loss(metric, s) * 0.01
+    if time_fn is not None:
+        losses["future"] = future_loss(
+            time_fn, s, s_next,
+            margin=cfg.future_margin if cfg else 0.1,
+        )
+    else:
+        losses["future"] = torch.tensor(0.0, device=s.device)
+
+    losses["cond"] = condition_number_loss(metric, s) * 0.1
 
     if stage >= 3:
-        # World model maximum likelihood
         losses["ml"] = maximum_likelihood_loss(world_model, s, s_next)
 
-        # Candidate-set matching
         losses["match"] = candidate_set_matching_loss(
             lagrangian, world_model, s, candidates,
             precomputed_lsem=precomputed_lsem_candidates,
         )
 
-        # Smoothness (if triplets of consecutive states available)
         if s_prev is not None:
             losses["smooth"] = smoothness_loss(s_prev, s, s_next)
         else:
             losses["smooth"] = torch.tensor(0.0, device=s.device)
 
-    # Weighted sum — use dynamic_weights if provided (from auto-calibration)
     lam = {
-        "time": cfg.lambda_geo if cfg else 0.5,
-        "cond": 0.01,
+        "cone": cfg.lambda_geo if cfg else 0.5,
+        "future": cfg.lambda_future if cfg else 0.5,
+        "cond": 0.1,
         "ml": cfg.lambda_wm if cfg else 1.0,
         "match": cfg.lambda_match if cfg else 1.0,
         "smooth": cfg.lambda_smooth if cfg else 0.1,
@@ -273,12 +292,12 @@ def calibrate_loss_weights(
     Returns:
         weights: dict of loss_name -> recommended λ
     """
-    l_time = time_likeness_loss(metric, s, s_next, margin=cfg.causal_margin if cfg else -0.1)
+    l_cone = contrastive_cone_loss(metric, s, s_next)
     l_ml = maximum_likelihood_loss(world_model, s, s_next)
     l_match = candidate_set_matching_loss(lagrangian, world_model, s, candidates)
 
     magnitudes = {
-        "time": l_time.item(),
+        "cone": l_cone.item(),
         "ml": l_ml.item(),
         "match": l_match.item(),
     }
@@ -288,7 +307,7 @@ def calibrate_loss_weights(
     # its configured weight rather than receiving a blown-up coefficient.
     active = {k: v for k, v in magnitudes.items() if v > 1e-4}
     if len(active) < 2:
-        return {"time": 1.0, "ml": 1.0, "match": 1.0}
+        return {"cone": 1.0, "ml": 1.0, "match": 1.0}
 
     ref = (torch.tensor(list(active.values())).prod() ** (1.0 / len(active))).item()
     weights = {}

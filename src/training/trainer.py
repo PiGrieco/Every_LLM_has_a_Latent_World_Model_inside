@@ -21,6 +21,7 @@ from ..models.metric import MetricNetwork
 from ..models.adapter import GeometryAdapter, IdentityAdapter
 from ..models.lagrangian import Lagrangian
 from ..models.world_model import ConditionalGaussianWorldModel
+from ..models.time_orientation import TimeOrientation
 from ..training.losses import compute_total_loss, calibrate_loss_weights
 from ..training.candidates import build_candidate_set_c1, build_candidate_set_c2, build_faiss_index
 from ..evaluation.metrics import compute_all_metrics
@@ -77,6 +78,14 @@ class WorldModelTrainer:
             n_layers=cfg.wm_layers,
         ).to(self.device)
 
+        # Time orientation τ_θ
+        self.time_fn = TimeOrientation(
+            dim=cfg.latent_dim,
+            hidden_dim=64,
+            n_layers=2,
+        ).to(self.device)
+        self.lagrangian.set_time_orientation(self.time_fn, cfg.lambda_future)
+
         # ---- Optimizer ----
         # Deduplicate: lagrangian contains metric as a submodule, so
         # collecting both would register metric params twice.
@@ -85,6 +94,7 @@ class WorldModelTrainer:
             list(self.adapter.parameters())
             + list(self.lagrangian.parameters())
             + list(self.world_model.parameters())
+            + list(self.time_fn.parameters())
         ):
             seen[id(p)] = p
         self.optimizer = optim.AdamW(
@@ -191,6 +201,7 @@ class WorldModelTrainer:
                 cfg=self.cfg,
                 stage=stage,
                 dynamic_weights=self._dynamic_weights,
+                time_fn=self.time_fn,
             )
 
             # Backward (skip if no trainable parameter contributes to the loss,
@@ -202,7 +213,8 @@ class WorldModelTrainer:
                     torch.nn.utils.clip_grad_norm_(
                         list(self.metric.parameters())
                         + list(self.world_model.parameters())
-                        + list(self.adapter.parameters()),
+                        + list(self.adapter.parameters())
+                        + list(self.time_fn.parameters()),
                         self.cfg.grad_clip,
                     )
                 self.optimizer.step()
@@ -296,7 +308,7 @@ class WorldModelTrainer:
 
             # Progress bar
             desc = f"S{stage}"
-            for k in ["total", "time", "ml", "match"]:
+            for k in ["total", "cone", "future", "ml", "match"]:
                 if k in losses:
                     desc += f" | {k}={losses[k]:.4f}"
             pbar.set_description(desc)

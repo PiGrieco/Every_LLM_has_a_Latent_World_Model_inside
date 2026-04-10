@@ -85,6 +85,9 @@ class Config:
     # Stage 2 (+ causality)
     lambda_causal: float = 1.0
     causal_margin: float = -0.1      # ε in the time-likeness loss (negative margin)
+    cone_margin_outside: float = 0.1  # Margin for space-like constraint on negatives
+    lambda_future: float = 0.5        # Weight for time orientation loss L_future
+    future_margin: float = 0.1        # δ: minimum required τ increment per step
     # Stage 3 (+ world model matching)
     lambda_match: float = 1.0
     lambda_smooth: float = 0.1

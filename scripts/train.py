@@ -112,9 +112,13 @@ def run_d0(cfg: Config):
         m2 = m2_time_reversal_gap(
             trainer.metric, trainer.lagrangian, trainer.world_model,
             fwd_trajs, rev_trajs,
+            time_fn=trainer.time_fn,
         )
         print(f"M2 (action gap): {m2['action_gap']:.4f}")
         print(f"M2 (logprob gap): {m2['logprob_gap']:.4f}")
+        if "delta_tau_forward" in m2:
+            print(f"M2 (Δτ forward):  {m2['delta_tau_forward']:.4f}")
+            print(f"M2 (Δτ reversed): {m2['delta_tau_reversed']:.4f}")
 
     # ---- Plots ----
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -166,6 +170,9 @@ def run_d0(cfg: Config):
         "geometry": cfg.geometry,
         "latent_dim": cfg.latent_dim,
     }
+    if "delta_tau_forward" in m2:
+        results["m2_delta_tau_forward"] = m2["delta_tau_forward"]
+        results["m2_delta_tau_reversed"] = m2["delta_tau_reversed"]
     with open(os.path.join(cfg.output_dir, f"d0_results_{cfg.geometry}.json"), "w") as f:
         json.dump(results, f, indent=2)
 

@@ -48,6 +48,8 @@ class Lagrangian(nn.Module):
         self.use_semantic_surrogate = use_semantic_surrogate
         self.interval_clamp_min = interval_clamp_min
         self.temperature = 1.0
+        self.time_fn = None
+        self.lambda_future = 0.0
 
         # Optional: learned surrogate for semantic cost
         # Useful when LM queries are expensive or in corpus-only setting
@@ -133,7 +135,15 @@ class Lagrangian(nn.Module):
         L_g = self.geometric_term(s, s_next)
         L_sem = self.semantic_term(s, s_next, precomputed_lsem)
 
-        return self.lambda_g * L_g + self.lambda_sem * L_sem
+        total = self.lambda_g * L_g + self.lambda_sem * L_sem
+
+        if self.time_fn is not None:
+            import torch.nn.functional as _F
+            d_tau = self.time_fn.delta_tau(s, s_next)
+            L_future = _F.softplus(0.1 - d_tau)
+            total = total + self.lambda_future * L_future
+
+        return total
 
     def action(
         self,
@@ -158,3 +168,8 @@ class Lagrangian(nn.Module):
     def set_temperature(self, T: float):
         """Set Gibbs temperature for candidate-set matching."""
         self.temperature = max(T, 0.1)
+
+    def set_time_orientation(self, time_fn, lambda_future: float = 0.5):
+        """Attach a time orientation function to the Lagrangian."""
+        self.time_fn = time_fn
+        self.lambda_future = lambda_future

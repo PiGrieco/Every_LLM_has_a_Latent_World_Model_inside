@@ -46,6 +46,7 @@ def m2_time_reversal_gap(
     world_model,
     forward_trajectories: list,
     reversed_trajectories: list,
+    time_fn=None,
 ) -> Dict[str, float]:
     """
     M2: Time-reversal gap.
@@ -97,12 +98,24 @@ def m2_time_reversal_gap(
     mean_lp_fwd = sum(forward_logprobs) / len(forward_logprobs)
     mean_lp_rev = sum(reversed_logprobs) / len(reversed_logprobs)
 
-    return {
+    result_dict = {
         "action_gap": mean_S_rev - mean_S_fwd,
         "logprob_gap": mean_lp_fwd - mean_lp_rev,
         "action_forward": mean_S_fwd,
         "action_reversed": mean_S_rev,
     }
+
+    if time_fn is not None:
+        fwd_dtau, rev_dtau = [], []
+        for fwd, rev in zip(forward_trajectories, reversed_trajectories):
+            dt_fwd = time_fn.delta_tau(fwd[:-1], fwd[1:]).mean().item()
+            dt_rev = time_fn.delta_tau(rev[:-1], rev[1:]).mean().item()
+            fwd_dtau.append(dt_fwd)
+            rev_dtau.append(dt_rev)
+        result_dict["delta_tau_forward"] = sum(fwd_dtau) / len(fwd_dtau)
+        result_dict["delta_tau_reversed"] = sum(rev_dtau) / len(rev_dtau)
+
+    return result_dict
 
 
 def m3_branching_separation(
