@@ -1,0 +1,59 @@
+# D0: Synthetic time-reversal experiment
+# The debugging harness — if this doesn't work, nothing will.
+#
+# Run all three geometry baselines:
+#   python -m scripts.train --config configs/d0_synthetic.yaml
+#   python -m scripts.train --config configs/d0_synthetic.yaml --geometry riemannian
+#   python -m scripts.train --config configs/d0_synthetic.yaml --geometry euclidean
+
+experiment_name: d0_time_reversal
+dataset: d0_synthetic
+seed: 42
+
+# Synthetic data params
+n_trajectories: 1000
+trajectory_length: 50
+drift_strength: 0.5
+noise_std: 0.1
+
+# Architecture — synthetic data is already in R^D, no encoder needed
+latent_dim: 16
+adapter_hidden: 256
+adapter_layers: 2
+metric_hidden: 128
+metric_layers: 2
+wm_hidden: 256
+wm_layers: 3
+
+# No segmentation for synthetic
+use_segmentation: false
+
+# Candidate sets — start simple
+candidate_strategy: c1
+candidate_set_size: 32
+
+# Loss weights
+lambda_g: 1.0
+lambda_sem: 0.0          # No semantic term for synthetic data
+lambda_match: 1.0
+lambda_smooth: 0.1
+lambda_wm: 1.0
+lambda_geo: 0.5
+causal_margin: -0.1
+
+# Training — fast iteration
+batch_size: 128
+lr: 0.001
+weight_decay: 0.00001
+stage2_epochs: 50
+stage3_epochs: 100
+grad_clip: 1.0
+eval_every: 10
+
+# Geometry (override via CLI for baselines)
+geometry: lorentzian
+
+# Paths
+output_dir: ./outputs/d0
+checkpoint_dir: ./checkpoints/d0
+cache_dir: ./cache

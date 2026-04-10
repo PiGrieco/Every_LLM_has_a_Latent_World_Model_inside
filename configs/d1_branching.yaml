@@ -1,0 +1,55 @@
+# D1: Synthetic branching experiment
+# Tests H3: are alternative continuations space-like separated?
+#
+# Run:
+#   python -m scripts.train --config configs/d1_branching.yaml
+
+experiment_name: d1_branching
+dataset: d1_branching
+seed: 42
+
+# Branching data params
+n_trajectories: 500
+prefix_length: 10
+n_branches: 4
+branch_length: 20
+drift_strength: 0.5
+noise_std: 0.1
+
+# Architecture
+latent_dim: 16
+metric_hidden: 128
+metric_layers: 2
+wm_hidden: 256
+wm_layers: 3
+
+# No segmentation
+use_segmentation: false
+
+# Candidate sets
+candidate_strategy: c1
+candidate_set_size: 32
+
+# Loss weights
+lambda_g: 1.0
+lambda_sem: 0.0
+lambda_match: 1.0
+lambda_smooth: 0.1
+lambda_wm: 1.0
+lambda_geo: 0.5
+causal_margin: -0.1
+
+# Training
+batch_size: 128
+lr: 0.001
+weight_decay: 0.00001
+stage2_epochs: 50
+stage3_epochs: 100
+grad_clip: 1.0
+eval_every: 10
+
+geometry: lorentzian
+
+output_dir: ./outputs/d1
+checkpoint_dir: ./checkpoints/d1
+cache_dir: ./cache

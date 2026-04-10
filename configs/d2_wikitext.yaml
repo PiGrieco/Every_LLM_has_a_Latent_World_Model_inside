@@ -1,0 +1,77 @@
+# D2: Real-text trajectories (WikiText-103)
+# The ecological validity test — does the framework work on real text?
+#
+# PREREQUISITE: Run encoding first:
+#   python -m scripts.encode_corpus --config configs/d2_wikitext.yaml
+#
+# Then train:
+#   python -m scripts.train --config configs/d2_wikitext.yaml
+
+experiment_name: d2_wikitext
+dataset: d2_wikitext
+seed: 42
+
+# WikiText params
+min_paragraphs: 5
+max_paragraphs: 80
+wikitext_split: train
+
+# Encoder
+encoder_name: sentence-transformers/all-MiniLM-L6-v2
+encoder_dim: 384
+encode_batch_size: 256
+
+# LM for semantic scores (Case A)
+lm_name: gpt2-medium
+lm_batch_size: 8
+lm_max_context: 512
+
+# Preprocessing
+n_pca_remove: 3
+normalize_embeddings: true
+
+# Architecture — adapter compresses 384 → 16
+latent_dim: 16
+adapter_hidden: 256
+adapter_layers: 2
+metric_hidden: 128
+metric_layers: 2
+wm_hidden: 256
+wm_layers: 3
+
+# Segmentation — try with and without
+use_segmentation: false    # Start without; ablate later
+seg_window: 3
+seg_l_min: 3
+seg_l_max: 30
+seg_tau_v_mult: 1.5
+seg_tau_kappa_mult: 1.5
+
+# Candidate sets — C1 for Stage 2, upgrade to C2 for Stage 3
+candidate_strategy: c1c2
+candidate_set_size: 32
+knn_rebuild_every: 10
+
+# Loss weights
+lambda_g: 1.0
+lambda_sem: 1.0            # Semantic term active (we have LM scores)
+lambda_match: 1.0
+lambda_smooth: 0.1
+lambda_wm: 1.0
+lambda_geo: 0.5
+causal_margin: -0.1
+
+# Training — longer for real data
+batch_size: 64
+lr: 0.0005
+weight_decay: 0.00001
+stage2_epochs: 80
+stage3_epochs: 150
+grad_clip: 1.0
+eval_every: 20
+
+geometry: lorentzian
+
+output_dir: ./outputs/d2
+checkpoint_dir: ./checkpoints/d2
+cache_dir: ./cache
