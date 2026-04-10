@@ -100,6 +100,11 @@ def build_candidate_set_c2(
     batch, dim = s.shape
     device = s.device
 
+    assert all_states.shape[1] == dim, (
+        f"Dimension mismatch: s is {dim}D but all_states is {all_states.shape[1]}D. "
+        f"Ensure kNN index is built on adapter-projected (latent) states, not raw embeddings."
+    )
+
     # Get kNN hard negatives
     if knn_index is not None:
         # Use FAISS index

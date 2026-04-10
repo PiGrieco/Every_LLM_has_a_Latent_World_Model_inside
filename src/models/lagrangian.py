@@ -47,6 +47,7 @@ class Lagrangian(nn.Module):
         self.lambda_sem = lambda_sem
         self.use_semantic_surrogate = use_semantic_surrogate
         self.interval_clamp_min = interval_clamp_min
+        self.temperature = 1.0
 
         # Optional: learned surrogate for semantic cost
         # Useful when LM queries are expensive or in corpus-only setting
@@ -153,3 +154,7 @@ class Lagrangian(nn.Module):
         s_next = trajectory[1:]  # (T-1, D)
         L = self.forward(s, s_next, precomputed_lsem)
         return L.sum()
+
+    def set_temperature(self, T: float):
+        """Set Gibbs temperature for candidate-set matching."""
+        self.temperature = max(T, 0.1)

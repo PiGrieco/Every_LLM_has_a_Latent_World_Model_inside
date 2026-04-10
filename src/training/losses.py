@@ -119,9 +119,12 @@ def candidate_set_matching_loss(
         lsem_flat = precomputed_lsem.reshape(-1)
 
     energy = lagrangian(s_flat, c_flat, lsem_flat).reshape(batch, n_cand)
-    # Temperature-scaled teacher logits. Clamp temperature from below
-    # to prevent division-by-near-zero in early training.
-    T = max(temperature, min_temperature)
+    # Use lagrangian's temperature if caller didn't override
+    if temperature == 1.0 and hasattr(lagrangian, 'temperature'):
+        T = lagrangian.temperature
+    else:
+        T = temperature
+    T = max(T, min_temperature)
     teacher_logits = -energy / T
 
     # ---- Student: world model log-probs on candidate set ----
@@ -194,6 +197,7 @@ def compute_total_loss(
     precomputed_lsem_candidates: Optional[torch.Tensor] = None,
     cfg=None,
     stage: int = 2,
+    dynamic_weights: Optional[dict] = None,
 ) -> dict:
     """
     Compute the total loss for a training step, respecting staged training.
@@ -230,7 +234,7 @@ def compute_total_loss(
         else:
             losses["smooth"] = torch.tensor(0.0, device=s.device)
 
-    # Weighted sum
+    # Weighted sum — use dynamic_weights if provided (from auto-calibration)
     lam = {
         "time": cfg.lambda_geo if cfg else 0.5,
         "cond": 0.01,
@@ -238,6 +242,8 @@ def compute_total_loss(
         "match": cfg.lambda_match if cfg else 1.0,
         "smooth": cfg.lambda_smooth if cfg else 0.1,
     }
+    if dynamic_weights is not None:
+        lam.update(dynamic_weights)
 
     total = torch.tensor(0.0, device=s.device)
     for key, val in losses.items():

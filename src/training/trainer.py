@@ -68,6 +68,7 @@ class WorldModelTrainer:
             latent_dim=cfg.latent_dim,
             interval_clamp_min=cfg.interval_clamp_min,
         ).to(self.device)
+        self.lagrangian.set_temperature(cfg.gibbs_temperature)
 
         # World model
         self.world_model = ConditionalGaussianWorldModel(
@@ -94,6 +95,7 @@ class WorldModelTrainer:
         self.current_epoch = 0
         self.knn_index = None
         self.all_states_cache = None
+        self._dynamic_weights = None
         self.history = {"epoch": [], "stage": []}
 
     def _prepare_data(self, states, next_states, lsem=None):
@@ -110,8 +112,20 @@ class WorldModelTrainer:
         )
 
     def _cache_all_states(self, states: torch.Tensor):
-        """Cache all states for kNN candidate retrieval."""
-        self.all_states_cache = states.to(self.device)
+        """Cache all states for kNN candidate retrieval.
+        For D2: states are raw embeddings; we project through the adapter
+        to get latent-space states for kNN (since energy is computed in
+        latent space, neighbors must be found there too).
+        """
+        with torch.no_grad():
+            if not isinstance(self.adapter, IdentityAdapter):
+                raw = states.to(self.device)
+                chunks = []
+                for i in range(0, len(raw), 1024):
+                    chunks.append(self.adapter(raw[i:i+1024]))
+                self.all_states_cache = torch.cat(chunks, dim=0)
+            else:
+                self.all_states_cache = states.to(self.device)
 
     def _maybe_rebuild_knn(self, epoch: int):
         """Rebuild kNN index periodically for C2 candidates."""
@@ -176,6 +190,7 @@ class WorldModelTrainer:
                 precomputed_lsem=lsem if lsem.abs().sum() > 0 else None,
                 cfg=self.cfg,
                 stage=stage,
+                dynamic_weights=self._dynamic_weights,
             )
 
             # Backward (skip if no trainable parameter contributes to the loss,
@@ -258,6 +273,7 @@ class WorldModelTrainer:
                         self.metric, self.lagrangian, self.world_model,
                         s_cal, sn_cal, cands, self.cfg,
                     )
+                    self._dynamic_weights = auto_weights
                     tqdm.write(f"  [Auto-calibrated λ] {auto_weights}")
                 except Exception:
                     pass

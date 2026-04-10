@@ -31,7 +31,9 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.config import Config
 from src.data.synthetic import generate_d0, generate_d1, extract_transitions
+from src.data.preprocessing import preprocess_trajectory_dataset
 from src.training.trainer import WorldModelTrainer
+from src.models.adapter import IdentityAdapter
 from src.evaluation.metrics import m2_time_reversal_gap, m3_branching_separation
 from src.evaluation.visualization import (
     plot_interval_histogram,
@@ -285,6 +287,154 @@ def run_d1(cfg: Config):
     return results
 
 
+def run_d2(cfg: Config):
+    """
+    Run D2: WikiText-103 real-text experiment.
+
+    Loads precomputed embeddings and LM log-probs from cache,
+    applies preprocessing, and trains the full pipeline with
+    semantic term active (lambda_sem > 0).
+    """
+    from pathlib import Path
+
+    print("\n" + "=" * 60)
+    print("D2: WIKITEXT-103 REAL-TEXT EXPERIMENT")
+    print(f"Geometry: {cfg.geometry} | D={cfg.latent_dim}")
+    print("=" * 60)
+
+    cache_dir = Path(cfg.cache_dir)
+
+    emb_path = cache_dir / "wikitext_embeddings.pt"
+    if not emb_path.exists():
+        print(f"ERROR: Cached embeddings not found at {emb_path}")
+        print("Run `python -m scripts.encode_corpus --config configs/d2_wikitext.yaml` first.")
+        return None
+
+    print("Loading cached embeddings...")
+    emb_data = torch.load(emb_path, weights_only=False)
+    embeddings = emb_data["embeddings"]
+    print(f"  {len(embeddings)} articles, {sum(len(e) for e in embeddings)} total paragraphs")
+
+    lm_path = cache_dir / "wikitext_lm_scores.pt"
+    has_lm_scores = lm_path.exists()
+    if has_lm_scores:
+        print("Loading cached LM scores...")
+        lm_data = torch.load(lm_path, weights_only=False)
+        lm_scores = lm_data["log_probs"]
+        print(f"  {sum(len(s) for s in lm_scores)} transition scores")
+    else:
+        print("No LM scores found — running without semantic term (Case B minimal)")
+        lm_scores = None
+        cfg.lambda_sem = 0.0
+
+    print("Preprocessing (centering, PC removal, normalization)...")
+    processed, preprocessor = preprocess_trajectory_dataset(
+        embeddings,
+        n_pca_remove=cfg.n_pca_remove,
+        normalize=cfg.normalize_embeddings,
+    )
+    print(f"  Preprocessed: {processed[0].shape[1]}D → adapter → {cfg.latent_dim}D")
+
+    all_s, all_s_next, all_lsem = [], [], []
+    for i, emb in enumerate(processed):
+        if len(emb) < 2:
+            continue
+        all_s.append(emb[:-1])
+        all_s_next.append(emb[1:])
+        if lm_scores is not None and i < len(lm_scores):
+            all_lsem.append(lm_scores[i])
+        else:
+            all_lsem.append(torch.zeros(len(emb) - 1))
+
+    states = torch.cat(all_s, dim=0)
+    next_states = torch.cat(all_s_next, dim=0)
+    lsem = torch.cat(all_lsem, dim=0)
+    print(f"Total transitions: {len(states)}")
+
+    n = len(states)
+    n_train = int(0.9 * n)
+    perm = torch.randperm(n)
+    train_idx, eval_idx = perm[:n_train], perm[n_train:]
+
+    train_s, eval_s = states[train_idx], states[eval_idx]
+    train_sn, eval_sn = next_states[train_idx], next_states[eval_idx]
+    train_lsem, eval_lsem = lsem[train_idx], lsem[eval_idx]
+    print(f"Train: {len(train_s)} | Eval: {len(eval_s)}")
+
+    cfg.encoder_dim = processed[0].shape[1]
+
+    trainer = WorldModelTrainer(cfg)
+    history = trainer.train(
+        train_s, train_sn,
+        lsem=train_lsem,
+        eval_states=eval_s,
+        eval_next_states=eval_sn,
+    )
+
+    device = trainer.device
+    trainer.metric.eval()
+    trainer.world_model.eval()
+    trainer.lagrangian.eval()
+    trainer.adapter.eval()
+
+    with torch.no_grad():
+        es = eval_s.to(device)
+        esn = eval_sn.to(device)
+        if not isinstance(trainer.adapter, IdentityAdapter):
+            es_latent = trainer.adapter(es)
+            esn_latent = trainer.adapter(esn)
+        else:
+            es_latent, esn_latent = es, esn
+
+        from src.evaluation.metrics import m1_timelike_rate, m5_predictive_nll, m4_cone_alignment
+        m1 = m1_timelike_rate(trainer.metric, es_latent, esn_latent)
+        m5 = m5_predictive_nll(trainer.world_model, es_latent, esn_latent)
+
+        print(f"\n--- D2 Results ({cfg.geometry}) ---")
+        print(f"M1 (time-likeness rate): {m1:.4f}")
+        print(f"M5 (predictive NLL):     {m5:.4f}")
+
+        from src.training.candidates import build_candidate_set_c1
+        cands, _ = build_candidate_set_c1(es_latent[:256], esn_latent[:256], candidate_size=32)
+        m4 = m4_cone_alignment(trainer.metric, trainer.lagrangian, es_latent[:256], cands)
+        print(f"M4 (cone Jaccard):       {m4['jaccard']:.4f}")
+        print(f"M4 (cone precision):     {m4['precision']:.4f}")
+        print(f"M4 (cone recall):        {m4['recall']:.4f}")
+
+    os.makedirs(cfg.output_dir, exist_ok=True)
+
+    neg_perm = torch.randperm(len(esn_latent))
+    plot_interval_histogram(
+        trainer.metric,
+        es_latent[:500], esn_latent[:500], esn_latent[neg_perm[:500]],
+        save_path=os.path.join(cfg.output_dir, f"d2_intervals_{cfg.geometry}.png"),
+        title=f"D2 WikiText Interval Distribution ({cfg.geometry})",
+    )
+    plot_training_curves(
+        history,
+        save_path=os.path.join(cfg.output_dir, f"d2_curves_{cfg.geometry}.png"),
+    )
+
+    trainer.save_checkpoint(os.path.join(cfg.checkpoint_dir, f"d2_{cfg.geometry}.pt"))
+
+    results = {
+        "m1_timelike_rate": m1,
+        "m4_cone_jaccard": m4["jaccard"],
+        "m4_cone_precision": m4["precision"],
+        "m4_cone_recall": m4["recall"],
+        "m5_nll": m5,
+        "geometry": cfg.geometry,
+        "latent_dim": cfg.latent_dim,
+        "n_transitions": len(states),
+        "has_semantic_term": has_lm_scores,
+    }
+    with open(os.path.join(cfg.output_dir, f"d2_results_{cfg.geometry}.json"), "w") as f:
+        json.dump(results, f, indent=2)
+
+    print(f"\nResults saved to {cfg.output_dir}/")
+    return results
+
+
 def main():
     parser = argparse.ArgumentParser(description="Train Lorentzian World Model")
     parser.add_argument("--config", type=str, default=None, help="Path to YAML config")
@@ -344,8 +494,7 @@ def main():
     elif cfg.dataset == "d1_branching":
         run_d1(cfg)
     elif cfg.dataset == "d2_wikitext":
-        print("D2 (WikiText) requires pre-encoding. Run encode_corpus.py first.")
-        print("Full D2 pipeline coming in next iteration.")
+        run_d2(cfg)
     else:
         raise ValueError(f"Unknown dataset: {cfg.dataset}")
 

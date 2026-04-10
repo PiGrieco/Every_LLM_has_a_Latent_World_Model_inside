@@ -148,6 +148,69 @@ def m3_branching_separation(
     return spacelike_count / total_pairs
 
 
+def m4_cone_alignment(
+    metric,
+    lagrangian,
+    s: torch.Tensor,
+    candidates: torch.Tensor,
+    p: float = 0.8,
+) -> dict:
+    """
+    M4: Cone alignment — overlap between the metric cone and the
+    probabilistic cone on a candidate set.
+
+    For each state s, we define:
+      - Metric cone: candidates where Δs^T g_θ(s) Δs ≤ 0 (time-like)
+      - Probabilistic cone: smallest set of candidates whose cumulative
+        Gibbs probability ≥ p (the top-p mass set)
+
+    Args:
+        metric: MetricNetwork
+        lagrangian: Lagrangian module
+        s: (batch, D) current states
+        candidates: (batch, C, D) candidate next states
+        p: mass level for the probabilistic cone (default 0.8)
+
+    Returns:
+        dict with jaccard, precision, recall (averaged over batch)
+    """
+    batch, n_cand, dim = candidates.shape
+
+    s_exp = s.unsqueeze(1).expand(-1, n_cand, -1)
+    delta = candidates - s_exp
+
+    s_flat = s_exp.reshape(-1, dim)
+    delta_flat = delta.reshape(-1, dim)
+    intervals = metric.squared_interval(s_flat, delta_flat).reshape(batch, n_cand)
+    metric_cone = (intervals <= 0)
+
+    c_flat = candidates.reshape(-1, dim)
+    energies = lagrangian(s_flat, c_flat).reshape(batch, n_cand)
+
+    gibbs_logits = -energies
+    gibbs_probs = torch.softmax(gibbs_logits, dim=-1)
+
+    sorted_probs, sorted_idx = gibbs_probs.sort(dim=-1, descending=True)
+    cumulative = sorted_probs.cumsum(dim=-1)
+
+    prob_cone = torch.zeros_like(metric_cone)
+    for i in range(batch):
+        cutoff = (cumulative[i] >= p).float().argmax().item()
+        top_indices = sorted_idx[i, : cutoff + 1]
+        prob_cone[i, top_indices] = True
+
+    intersection = (metric_cone & prob_cone).float().sum(dim=-1)
+    union = (metric_cone | prob_cone).float().sum(dim=-1)
+    metric_cone_size = metric_cone.float().sum(dim=-1)
+    prob_cone_size = prob_cone.float().sum(dim=-1)
+
+    jaccard = (intersection / union.clamp(min=1)).mean().item()
+    precision = (intersection / prob_cone_size.clamp(min=1)).mean().item()
+    recall = (intersection / metric_cone_size.clamp(min=1)).mean().item()
+
+    return {"jaccard": jaccard, "precision": precision, "recall": recall}
+
+
 def m5_predictive_nll(
     world_model,
     s: torch.Tensor,
@@ -227,6 +290,13 @@ def compute_all_metrics(
             forward_trajectories, reversed_trajectories,
         )
         results.update({f"m2_{k}": v for k, v in m2.items()})
+
+    # M4: Cone alignment (needs candidate sets)
+    if s.shape[0] >= 16:
+        from ..training.candidates import build_candidate_set_c1
+        cands_m4, _ = build_candidate_set_c1(s[:256], s_next[:256], candidate_size=32)
+        m4 = m4_cone_alignment(metric, lagrangian, s[:256], cands_m4)
+        results.update({f"m4_{k}": v for k, v in m4.items()})
 
     # M3: Branching separation (needs branch data)
     if branch_data:
