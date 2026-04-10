@@ -318,7 +318,7 @@ def main():
     if torch.cuda.is_available():
         cfg.device = "cuda"
         gpu_name = torch.cuda.get_device_name()
-        gpu_mem_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"Using GPU: {gpu_name} ({gpu_mem_gb:.1f} GB)")
 
         # Enable TF32 for Ampere+ GPUs (free ~2-3x speedup on matmuls)

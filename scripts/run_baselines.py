@@ -29,7 +29,7 @@ from src.config import Config
 def _gpu_defaults():
     """Return (batch_size, n_trajectories) scaled for the available GPU."""
     if torch.cuda.is_available():
-        gpu_mem_gb = torch.cuda.get_device_properties(0).total_mem / 1e9
+        gpu_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
         torch.set_float32_matmul_precision("high")
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
