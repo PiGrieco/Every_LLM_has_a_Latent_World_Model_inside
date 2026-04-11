@@ -100,6 +100,7 @@ class Config:
     lambda_geo: float = 0.5          # Overall weight for Lgeo = Ltime + Lsmooth + Ltriplet
     lambda_g: float = 1.0            # Weight of geometric term in Lagrangian
     lambda_sem: float = 1.0          # Weight of semantic term in Lagrangian
+    lambda_sem_reg: float = 0.1      # Weight for surrogate regression loss (D2)
 
     # ---- Training ----
     batch_size: int = 128

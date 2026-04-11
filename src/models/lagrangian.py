@@ -86,34 +86,26 @@ class Lagrangian(nn.Module):
         interval_clamped = interval.clamp(min=self.interval_clamp_min)
         return 0.5 * interval_clamped
 
-    def semantic_term(
-        self,
-        s: torch.Tensor,
-        s_next: torch.Tensor,
-        precomputed_lsem: torch.Tensor = None,
-    ) -> torch.Tensor:
+    def semantic_term(self, s, s_next, precomputed_lsem=None):
         """
-        L_sem(s_t, s_{t+1}).
+        Compute L_sem(s, s').
 
-        Either uses precomputed values (from LM log-probs) or the learned
-        surrogate network.
-
-        Args:
-            s, s_next: (batch, D) states
-            precomputed_lsem: (batch,) optional precomputed -log P_LM values
-
-        Returns:
-            L_sem: (batch,) semantic Lagrangian values
+        Three modes:
+        1. precomputed_lsem provided AND not using surrogate:
+           Use the precomputed value directly (for true transitions only).
+        2. use_semantic_surrogate is True:
+           Use the surrogate network to produce candidate-specific costs.
+           This is ESSENTIAL for candidate matching — precomputed values
+           are per-transition and can't score arbitrary candidates.
+        3. Neither: return zero (synthetic data, no semantic signal).
         """
-        if precomputed_lsem is not None:
-            return precomputed_lsem
-
         if self.use_semantic_surrogate:
-            # Surrogate takes concatenated (s, s_next) and predicts cost
             concat = torch.cat([s, s_next], dim=-1)
             return self.surrogate(concat).squeeze(-1)
 
-        # No semantic term available (synthetic data case)
+        if precomputed_lsem is not None:
+            return precomputed_lsem
+
         return torch.zeros(s.shape[0], device=s.device)
 
     def forward(
@@ -138,8 +130,10 @@ class Lagrangian(nn.Module):
 
         total = self.lambda_g * L_g + self.lambda_sem * L_sem
 
+        # Time orientation via A_met's local frame (Lorentzian)
+        # or fallback MLP (baselines). Makes action asymmetric.
         if self.time_fn is not None:
-            d_tau = self.time_fn.delta_tau(s, s_next)
+            d_tau = self.time_fn.delta_tau(self.metric, s, s_next)
             L_future = F.softplus(0.1 - d_tau)
             total = total + self.lambda_future * L_future
 

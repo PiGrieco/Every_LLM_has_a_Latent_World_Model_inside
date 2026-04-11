@@ -1,27 +1,26 @@
 """
-Time Orientation τ_θ(s): a learned scalar function that assigns a
-"narrative time" to each latent state, breaking time-reversal symmetry.
+Time Orientation τ_θ: derives the arrow of time from the metric's
+local Minkowski frame.
 
-In Lorentzian geometry, the metric gives you cones (time-like vs space-like)
-but not a preferred direction within the cone. You need a separate structure
-— a time orientation — to distinguish "future" from "past". In physics this
-is a global topological choice; in our framework, we learn it from data.
+KEY DESIGN: τ is NOT an independent MLP. For Lorentzian geometry,
+the time increment is the zeroth component of the displacement
+in the local Minkowski frame defined by A_met(s):
 
-τ_θ: M → R is a small MLP that should satisfy τ_θ(s_{t+1}) > τ_θ(s_t)
-for all observed forward transitions. This makes the Lagrangian asymmetric:
+    Δτ(s, s') = (A_met(s) · (s' - s))_0
 
-    L_future(s_t, s_{t+1}) = Softplus(δ - (τ(s_{t+1}) - τ(s_t)))
+This works because the metric is parameterized as g = A^T η A
+where η = diag(-1, 1, ..., 1). The matrix A_met acts as a vielbein
+(local frame), and the zeroth coordinate in that frame is the one
+with the minus sign in η — i.e., the time direction.
 
-Forward transitions: Δτ > δ → L_future ≈ 0  (low cost)
-Reversed transitions: Δτ < 0 → L_future >> 0  (high cost)
+Advantages over eigendecomposition:
+  - No O(D³) eigenvalue computation per sample
+  - Numerically stable (no eigenvalue crossings)
+  - Differentiable through A_met (already in the computation graph)
+  - Conceptually natural (uses the frame, not a derived quantity)
 
-This term is:
-  - Non-negative (no unbounded negative energy problem)
-  - Smooth and differentiable everywhere
-  - Explicitly asymmetric under time reversal
-
-When added to the Lagrangian, the Gibbs kernel exp(-L_θ) genuinely prefers
-forward over backward transitions, making M2(action gap) a meaningful probe.
+For Riemannian/Euclidean baselines: no time-like direction exists,
+so we fall back to a learned MLP (harder to train, no geometric anchor).
 """
 
 import torch
@@ -31,89 +30,123 @@ import torch.nn.functional as F
 
 class TimeOrientation(nn.Module):
     """
-    Learned time function τ_θ: R^D → R.
+    Geometry-coupled time orientation via A_met's local frame.
 
-    A small MLP that maps latent states to a scalar "narrative time".
-    Trained so that τ increases along forward trajectories.
-
-    The output is unconstrained (can be any real number), and the
-    training signal comes from the future loss which penalizes
-    non-increasing τ along observed transitions.
+    For Lorentzian: Δτ = (A_met(s) · Δs)_0 (zeroth Minkowski component)
+    For others: Δτ = MLP(s_{t+1}) - MLP(s_t) (fallback, no anchor)
     """
 
-    def __init__(self, dim: int, hidden_dim: int = 64, n_layers: int = 2):
+    def __init__(self, dim: int, geometry: str = "lorentzian",
+                 hidden_dim: int = 64, n_layers: int = 2):
         super().__init__()
+        self.dim = dim
+        self.geometry = geometry
 
-        layers = []
-        dims = [dim] + [hidden_dim] * n_layers + [1]
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:
-                layers.append(nn.GELU())
-        self.net = nn.Sequential(*layers)
+        if geometry != "lorentzian":
+            # Fallback MLP for non-Lorentzian geometries.
+            # Has NO geometric anchor — must learn directionality
+            # purely from data, which is harder and noisier.
+            layers = []
+            dims = [dim] + [hidden_dim] * n_layers + [1]
+            for i in range(len(dims) - 1):
+                layers.append(nn.Linear(dims[i], dims[i + 1]))
+                if i < len(dims) - 2:
+                    layers.append(nn.GELU())
+            self.fallback_mlp = nn.Sequential(*layers)
+            with torch.no_grad():
+                self.fallback_mlp[-1].weight.mul_(0.01)
+                self.fallback_mlp[-1].bias.zero_()
 
-        # Initialize to produce small outputs near zero.
-        # This means Δτ starts near zero and the loss is initially
-        # non-zero but not huge, giving stable early gradients.
-        with torch.no_grad():
-            self.net[-1].weight.mul_(0.01)
-            self.net[-1].bias.zero_()
-
-    def forward(self, s: torch.Tensor) -> torch.Tensor:
+    def _get_time_component(self, metric, s: torch.Tensor,
+                            delta_s: torch.Tensor) -> torch.Tensor:
         """
-        Compute τ_θ(s) for a batch of states.
+        Extract the time component of a displacement in the local
+        Minkowski frame defined by A_met(s).
+
+        Δτ = (A_met(s) · Δs)_0
+
+        This is the natural "clock reading" for the displacement:
+        how much it advances along the direction that carries the
+        minus sign in η.
 
         Args:
-            s: (batch, D) latent states
+            metric: MetricNetwork (must have _get_a_met method)
+            s: (batch, D) current states
+            delta_s: (batch, D) displacement vectors
 
         Returns:
-            tau: (batch,) scalar time values
+            dt: (batch,) time components
         """
-        return self.net(s).squeeze(-1)
+        A_met = metric._get_a_met(s)  # (batch, D, D)
+        # A_met @ Δs gives the displacement in the local Minkowski frame
+        # Shape: (batch, D, 1) -> squeeze to (batch, D)
+        local_displacement = torch.bmm(A_met, delta_s.unsqueeze(-1)).squeeze(-1)
+        # The zeroth component is the time direction (the one with -1 in η)
+        return local_displacement[:, 0]
 
-    def delta_tau(self, s: torch.Tensor, s_next: torch.Tensor) -> torch.Tensor:
+    def delta_tau(self, metric, s: torch.Tensor,
+                  s_next: torch.Tensor) -> torch.Tensor:
         """
-        Compute Δτ = τ(s_{t+1}) - τ(s_t).
+        Compute Δτ = time increment between consecutive states.
 
-        Positive Δτ = forward in narrative time.
-        Negative Δτ = backward (time-reversed).
+        For Lorentzian: projection of displacement onto the metric's
+        time-like direction via A_met. This is FREE (no extra parameters,
+        no eigendecomposition) — it reuses the metric's own structure.
+
+        For others: difference of MLP outputs (must learn from scratch).
 
         Args:
+            metric: MetricNetwork
             s: (batch, D) current states
             s_next: (batch, D) next states
 
         Returns:
             d_tau: (batch,) time increments
         """
-        return self.forward(s_next) - self.forward(s)
+        if self.geometry == "lorentzian":
+            delta_s = s_next - s
+            return self._get_time_component(metric, s, delta_s)
+        else:
+            tau_s = self.fallback_mlp(s).squeeze(-1)
+            tau_sn = self.fallback_mlp(s_next).squeeze(-1)
+            return tau_sn - tau_s
+
+    def forward(self, metric, s: torch.Tensor) -> torch.Tensor:
+        """
+        Compute τ(s) — narrative time at state s.
+
+        For Lorentzian: τ(s) = (A_met(s) · s)_0
+        (absolute time = projection of state onto local time axis)
+
+        For others: τ(s) = MLP(s)
+        """
+        if self.geometry == "lorentzian":
+            return self._get_time_component(metric, s, s)
+        else:
+            return self.fallback_mlp(s).squeeze(-1)
 
 
 def future_loss(
     time_fn: TimeOrientation,
+    metric,
     s: torch.Tensor,
     s_next: torch.Tensor,
     margin: float = 0.1,
+    target_delta: float = 1.0,
+    band_weight: float = 1.0,
 ) -> torch.Tensor:
     """
-    L_future = E[Softplus(δ - Δτ)]
+    Band-pass future loss with metric coupling.
 
-    Penalizes transitions where τ doesn't increase by at least δ.
-    Softplus is smooth and always non-negative, avoiding the
-    unbounded-below energy problem.
+    1. Forward penalty: Softplus(margin - Δτ) — must advance in time
+    2. Band-pass: (Δτ - target_delta)² — normalize scale per-sample
 
-    For forward transitions: Δτ >> δ → Softplus(δ - Δτ) ≈ 0
-    For reversed transitions: Δτ << 0 → Softplus(δ - Δτ) >> 0
-
-    Args:
-        time_fn: TimeOrientation module
-        s: (batch, D) current states
-        s_next: (batch, D) next states
-        margin: minimum required τ increment (δ)
-
-    Returns:
-        loss: scalar, average future loss
+    For Lorentzian, Δτ comes from A_met (geometric, no extra params).
+    For baselines, Δτ comes from fallback MLP (must learn from scratch).
     """
-    d_tau = time_fn.delta_tau(s, s_next)  # (batch,)
-    # Softplus(δ - Δτ) = log(1 + exp(δ - Δτ))
-    loss = F.softplus(margin - d_tau).mean()
-    return loss
+    d_tau = time_fn.delta_tau(metric, s, s_next)
+
+    loss_forward = F.softplus(margin - d_tau).mean()
+    loss_band = ((d_tau - target_delta) ** 2).mean()
+
+    return loss_forward + band_weight * loss_band

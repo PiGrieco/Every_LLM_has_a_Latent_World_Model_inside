@@ -108,8 +108,8 @@ def m2_time_reversal_gap(
     if time_fn is not None:
         fwd_dtau, rev_dtau = [], []
         for fwd, rev in zip(forward_trajectories, reversed_trajectories):
-            dt_fwd = time_fn.delta_tau(fwd[:-1], fwd[1:]).mean().item()
-            dt_rev = time_fn.delta_tau(rev[:-1], rev[1:]).mean().item()
+            dt_fwd = time_fn.delta_tau(metric, fwd[:-1], fwd[1:]).mean().item()
+            dt_rev = time_fn.delta_tau(metric, rev[:-1], rev[1:]).mean().item()
             fwd_dtau.append(dt_fwd)
             rev_dtau.append(dt_rev)
         result_dict["delta_tau_forward"] = sum(fwd_dtau) / len(fwd_dtau)

@@ -49,12 +49,13 @@ seg_tau_kappa_mult: 1.5
 
 # Candidate sets — C1 for Stage 2, upgrade to C2 for Stage 3
 candidate_strategy: c1c2
-candidate_set_size: 32
+candidate_set_size: 64
 knn_rebuild_every: 10
 
 # Loss weights
 lambda_g: 1.0
-lambda_sem: 1.0            # Semantic term active (we have LM scores)
+lambda_sem: 0.5            # Semantic term active (we have LM scores)
+lambda_sem_reg: 0.1        # Surrogate regression weight
 lambda_match: 1.0
 lambda_smooth: 0.1
 lambda_wm: 1.0

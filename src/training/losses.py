@@ -166,6 +166,38 @@ def maximum_likelihood_loss(
     return world_model.neg_log_prob(s, s_next).mean()
 
 
+def surrogate_regression_loss(
+    lagrangian,
+    s: torch.Tensor,
+    s_next: torch.Tensor,
+    precomputed_lsem: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Train the semantic surrogate to predict LM costs on true transitions.
+
+    This anchors the surrogate to real LM scores so that when it
+    evaluates candidates (for which we don't have LM scores), its
+    predictions are meaningful.
+
+    Uses a combination of MSE (for calibration) and ranking loss
+    (for correct ordering).
+    """
+    pred = lagrangian.surrogate(
+        torch.cat([s, s_next], dim=-1)
+    ).squeeze(-1)
+
+    mse = F.mse_loss(pred, precomputed_lsem)
+
+    perm = torch.randperm(len(s), device=s.device)
+    s_neg = s_next[perm]
+    pred_neg = lagrangian.surrogate(
+        torch.cat([s, s_neg], dim=-1)
+    ).squeeze(-1)
+    ranking = F.relu(pred - pred_neg + 0.5).mean()
+
+    return mse + ranking
+
+
 def condition_number_loss(
     metric,
     s: torch.Tensor,
@@ -222,32 +254,54 @@ def compute_total_loss(
         rate_weight=getattr(cfg, 'cone_rate_weight', 1.0),
     )
 
-    # Future loss + tau gauge only activate in second half of Stage 2
-    # (lets the metric learn the cone structure first)
-    stage2_total = cfg.stage2_epochs if cfg else 50
-    future_active = (time_fn is not None) and (
-        (current_epoch >= stage2_total // 2) or (stage >= 3)
-    )
-
-    if future_active:
+    # --- Time orientation (coupled to metric via A_met) ---
+    if time_fn is not None:
         from ..models.time_orientation import future_loss as _future_loss
-        losses["future"] = _future_loss(
-            time_fn, s, s_next,
-            margin=cfg.future_margin if cfg else 0.1,
-        )
-        d_tau = time_fn.delta_tau(s, s_next)
-        losses["tau_gauge"] = (d_tau.mean() - 1.0) ** 2 + (d_tau.var() - 0.25) ** 2
+        stage2_total = cfg.stage2_epochs if cfg else 50
+        future_active = (current_epoch >= stage2_total // 2) or (stage >= 3)
+        if future_active:
+            losses["future"] = _future_loss(
+                time_fn, metric, s, s_next,
+                margin=cfg.future_margin if cfg else 0.1,
+                target_delta=1.0,
+                band_weight=1.0,
+            )
+        else:
+            losses["future"] = torch.tensor(0.0, device=s.device)
     else:
         losses["future"] = torch.tensor(0.0, device=s.device)
-        losses["tau_gauge"] = torch.tensor(0.0, device=s.device)
+
+    # tau_gauge is now handled inside future_loss's band-pass term
+    losses["tau_gauge"] = torch.tensor(0.0, device=s.device)
 
     losses["cond"] = condition_number_loss(metric, s)
 
     if stage >= 3:
+        # When surrogate is active, DON'T pass precomputed_lsem to matching.
+        # The surrogate will compute candidate-specific costs inside
+        # the Lagrangian. Passing precomputed_lsem would override the
+        # surrogate with a constant (the true transition cost) for all
+        # candidates, which defeats the purpose.
+        match_lsem = None
+        if not getattr(lagrangian, 'use_semantic_surrogate', False):
+            match_lsem = precomputed_lsem_candidates
+
         losses["match"] = candidate_set_matching_loss(
             lagrangian, world_model, s, candidates,
-            precomputed_lsem=precomputed_lsem_candidates,
+            precomputed_lsem=match_lsem,
         )
+        # ML as calibration regularizer (small weight, prevents M5 blowup)
+        losses["ml"] = maximum_likelihood_loss(world_model, s, s_next)
+
+        # Surrogate regression: anchor surrogate to LM scores (D2 only)
+        if (
+            getattr(lagrangian, 'use_semantic_surrogate', False)
+            and precomputed_lsem is not None
+            and precomputed_lsem.abs().sum() > 0
+        ):
+            losses["sem_reg"] = surrogate_regression_loss(
+                lagrangian, s, s_next, precomputed_lsem,
+            )
 
     lam = {
         "cone": cfg.lambda_geo if cfg else 0.5,
@@ -255,6 +309,8 @@ def compute_total_loss(
         "tau_gauge": 1.0,
         "cond": 0.1,
         "match": cfg.lambda_match if cfg else 1.0,
+        "ml": 0.1,
+        "sem_reg": getattr(cfg, 'lambda_sem_reg', 0.1),
     }
     if dynamic_weights is not None:
         lam.update(dynamic_weights)

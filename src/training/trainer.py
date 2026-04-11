@@ -59,8 +59,9 @@ class WorldModelTrainer:
             geometry=cfg.geometry,
         ).to(self.device)
 
-        # Lagrangian
-        use_surrogate = cfg.dataset == "d2_wikitext" and cfg.candidate_strategy != "c1"
+        # Lagrangian — enable semantic surrogate for D2 (needed for
+        # candidate-specific semantic costs in the matching loss)
+        use_surrogate = (cfg.dataset == "d2_wikitext" and cfg.lambda_sem > 0)
         self.lagrangian = Lagrangian(
             metric=self.metric,
             lambda_g=cfg.lambda_g,
@@ -78,9 +79,11 @@ class WorldModelTrainer:
             n_layers=cfg.wm_layers,
         ).to(self.device)
 
-        # Time orientation τ_θ
+        # Time orientation τ_θ — coupled to metric for Lorentzian,
+        # fallback MLP for baselines
         self.time_fn = TimeOrientation(
             dim=cfg.latent_dim,
+            geometry=cfg.geometry,
             hidden_dim=64,
             n_layers=2,
         ).to(self.device)
@@ -89,13 +92,17 @@ class WorldModelTrainer:
         # ---- Optimizer ----
         # Deduplicate: lagrangian contains metric as a submodule, so
         # collecting both would register metric params twice.
-        seen = {}
-        for p in (
+        all_params = (
             list(self.adapter.parameters())
+            + list(self.metric.parameters())
             + list(self.lagrangian.parameters())
             + list(self.world_model.parameters())
-            + list(self.time_fn.parameters())
-        ):
+        )
+        # Only add time_fn params for non-Lorentzian (fallback MLP)
+        if cfg.geometry != "lorentzian" and hasattr(self.time_fn, 'fallback_mlp'):
+            all_params += list(self.time_fn.parameters())
+        seen = {}
+        for p in all_params:
             seen[id(p)] = p
         self.optimizer = optim.AdamW(
             list(seen.values()), lr=cfg.lr, weight_decay=cfg.weight_decay
@@ -211,13 +218,14 @@ class WorldModelTrainer:
             if losses["total"].requires_grad:
                 losses["total"].backward()
                 if self.cfg.grad_clip > 0:
-                    torch.nn.utils.clip_grad_norm_(
+                    clip_params = (
                         list(self.metric.parameters())
                         + list(self.world_model.parameters())
                         + list(self.adapter.parameters())
-                        + list(self.time_fn.parameters()),
-                        self.cfg.grad_clip,
                     )
+                    if hasattr(self.time_fn, 'fallback_mlp'):
+                        clip_params += list(self.time_fn.parameters())
+                    torch.nn.utils.clip_grad_norm_(clip_params, self.cfg.grad_clip)
                 self.optimizer.step()
 
             # Track time-like fraction for diagnostics
@@ -259,6 +267,42 @@ class WorldModelTrainer:
 
         # Cache states for kNN
         self._cache_all_states(states)
+
+        # ---- Sanity check: M1 at initialization (before any training) ----
+        # On D0 with drift along dim 0 and initial metric ≈ η,
+        # M1 should already be ~0.6-0.8. If it's 0, something is
+        # fundamentally wrong (wrong η, dimension mismatch, etc.)
+        with torch.no_grad():
+            self.metric.eval()
+            sample_s = states[:min(1000, len(states))].to(self.device)
+            sample_sn = next_states[:min(1000, len(next_states))].to(self.device)
+            # Apply adapter if needed
+            if not isinstance(self.adapter, IdentityAdapter):
+                sample_s_lat = self.adapter(sample_s)
+                sample_sn_lat = self.adapter(sample_sn)
+            else:
+                sample_s_lat = sample_s
+                sample_sn_lat = sample_sn
+            delta = sample_sn_lat - sample_s_lat
+            init_intervals = self.metric.squared_interval(sample_s_lat, delta)
+            init_m1 = (init_intervals < 0).float().mean().item()
+            init_mean = init_intervals.mean().item()
+            init_std = init_intervals.std().item()
+            print(f"\n  [INIT SANITY CHECK] M1={init_m1:.4f} | "
+                  f"mean(Δσ²)={init_mean:.4f} | std(Δσ²)={init_std:.4f}")
+            if init_m1 < 0.1 and self.cfg.geometry == "lorentzian":
+                print(f"  ⚠️  WARNING: M1 is very low at initialization. "
+                      f"Expected ~0.6+ for D0 with drift along dim 0. "
+                      f"Check metric initialization and data alignment.")
+            # Check Δτ at initialization (should be nonzero for Lorentzian)
+            init_dtau = self.time_fn.delta_tau(
+                self.metric, sample_s_lat, sample_sn_lat
+            ).mean().item()
+            init_dtau_std = self.time_fn.delta_tau(
+                self.metric, sample_s_lat, sample_sn_lat
+            ).std().item()
+            print(f"  [INIT SANITY CHECK] mean(Δτ)={init_dtau:.4f} | std(Δτ)={init_dtau_std:.4f}")
+            self.metric.train()
 
         total_epochs = self.cfg.stage2_epochs + self.cfg.stage3_epochs
         calibrated = False  # Track whether we've calibrated for stage 3

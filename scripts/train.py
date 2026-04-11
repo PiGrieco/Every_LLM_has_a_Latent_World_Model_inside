@@ -120,6 +120,18 @@ def run_d0(cfg: Config):
             print(f"M2 (Δτ forward):  {m2['delta_tau_forward']:.4f}")
             print(f"M2 (Δτ reversed): {m2['delta_tau_reversed']:.4f}")
 
+        # Decompose action gap: geometry-only vs total
+        # Disable τ term, recompute action gap
+        orig_lf = trainer.lagrangian.lambda_future
+        trainer.lagrangian.lambda_future = 0.0
+        m2_geo = m2_time_reversal_gap(
+            trainer.metric, trainer.lagrangian, trainer.world_model,
+            fwd_trajs[:50], rev_trajs[:50],
+            time_fn=trainer.time_fn,
+        )
+        trainer.lagrangian.lambda_future = orig_lf
+        print(f"M2 (geometry-only action gap): {m2_geo['action_gap']:.4f}")
+
     # ---- Plots ----
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -317,15 +329,17 @@ def run_d1(cfg: Config):
     return results
 
 
-def run_d2(cfg: Config):
+def run_d2(cfg):
     """
-    Run D2: WikiText-103 real-text experiment.
-
-    Loads precomputed embeddings and LM log-probs from cache,
-    applies preprocessing, and trains the full pipeline with
-    semantic term active (lambda_sem > 0).
+    D2: WikiText-103 real-text experiment.
+    Tests the actual thesis: does Lorentzian geometry extract meaningful
+    structure from a real LM's implicit world model?
     """
+    import torch
     from pathlib import Path
+    from src.data.preprocessing import preprocess_trajectory_dataset
+    from src.training.trainer import WorldModelTrainer
+    from src.evaluation.metrics import m1_timelike_rate, m5_predictive_nll
 
     print("\n" + "=" * 60)
     print("D2: WIKITEXT-103 REAL-TEXT EXPERIMENT")
@@ -334,134 +348,122 @@ def run_d2(cfg: Config):
 
     cache_dir = Path(cfg.cache_dir)
 
+    # Load cached embeddings
     emb_path = cache_dir / "wikitext_embeddings.pt"
     if not emb_path.exists():
-        print(f"ERROR: Cached embeddings not found at {emb_path}")
-        print("Run `python -m scripts.encode_corpus --config configs/d2_wikitext.yaml` first.")
+        print(f"ERROR: Run encode_corpus.py first")
         return None
 
     print("Loading cached embeddings...")
     emb_data = torch.load(emb_path, weights_only=False)
     embeddings = emb_data["embeddings"]
-    print(f"  {len(embeddings)} articles, {sum(len(e) for e in embeddings)} total paragraphs")
+    print(f"  {len(embeddings)} articles, {sum(len(e) for e in embeddings)} paragraphs")
 
+    # Load cached LM scores
     lm_path = cache_dir / "wikitext_lm_scores.pt"
-    has_lm_scores = lm_path.exists()
-    if has_lm_scores:
+    has_lm = lm_path.exists()
+    if has_lm:
         print("Loading cached LM scores...")
         lm_data = torch.load(lm_path, weights_only=False)
         lm_scores = lm_data["log_probs"]
         print(f"  {sum(len(s) for s in lm_scores)} transition scores")
     else:
-        print("No LM scores found — running without semantic term (Case B minimal)")
+        print("No LM scores — running without semantic term")
         lm_scores = None
         cfg.lambda_sem = 0.0
 
-    print("Preprocessing (centering, PC removal, normalization)...")
-    processed, preprocessor = preprocess_trajectory_dataset(
+    # Preprocess
+    print("Preprocessing embeddings...")
+    processed, _ = preprocess_trajectory_dataset(
         embeddings,
         n_pca_remove=cfg.n_pca_remove,
         normalize=cfg.normalize_embeddings,
     )
-    print(f"  Preprocessed: {processed[0].shape[1]}D → adapter → {cfg.latent_dim}D")
 
-    all_s, all_s_next, all_lsem = [], [], []
+    # Extract transitions
+    all_s, all_sn, all_lsem = [], [], []
     for i, emb in enumerate(processed):
         if len(emb) < 2:
             continue
         all_s.append(emb[:-1])
-        all_s_next.append(emb[1:])
+        all_sn.append(emb[1:])
         if lm_scores is not None and i < len(lm_scores):
             all_lsem.append(lm_scores[i])
         else:
             all_lsem.append(torch.zeros(len(emb) - 1))
 
     states = torch.cat(all_s, dim=0)
-    next_states = torch.cat(all_s_next, dim=0)
+    next_states = torch.cat(all_sn, dim=0)
     lsem = torch.cat(all_lsem, dim=0)
     print(f"Total transitions: {len(states)}")
 
+    # Train/eval split
     n = len(states)
-    n_train = int(0.9 * n)
     perm = torch.randperm(n)
-    train_idx, eval_idx = perm[:n_train], perm[n_train:]
+    n_train = int(0.9 * n)
+    train_s, eval_s = states[perm[:n_train]], states[perm[n_train:]]
+    train_sn, eval_sn = next_states[perm[:n_train]], next_states[perm[n_train:]]
+    train_lsem = lsem[perm[:n_train]]
+    cfg.encoder_dim = states.shape[1]
 
-    train_s, eval_s = states[train_idx], states[eval_idx]
-    train_sn, eval_sn = next_states[train_idx], next_states[eval_idx]
-    train_lsem, eval_lsem = lsem[train_idx], lsem[eval_idx]
-    print(f"Train: {len(train_s)} | Eval: {len(eval_s)}")
-
-    cfg.encoder_dim = processed[0].shape[1]
-
+    # Train
     trainer = WorldModelTrainer(cfg)
-    history = trainer.train(
-        train_s, train_sn,
-        lsem=train_lsem,
-        eval_states=eval_s,
-        eval_next_states=eval_sn,
-    )
+    history = trainer.train(train_s, train_sn, lsem=train_lsem,
+                            eval_states=eval_s, eval_next_states=eval_sn)
 
+    # Evaluate in latent space
     device = trainer.device
     trainer.metric.eval()
     trainer.world_model.eval()
-    trainer.lagrangian.eval()
     trainer.adapter.eval()
 
     with torch.no_grad():
-        es = eval_s.to(device)
-        esn = eval_sn.to(device)
-        if not isinstance(trainer.adapter, IdentityAdapter):
-            es_latent = trainer.adapter(es)
-            esn_latent = trainer.adapter(esn)
+        es, esn = eval_s.to(device), eval_sn.to(device)
+        if hasattr(trainer.adapter, 'net'):
+            es_lat = trainer.adapter(es)
+            esn_lat = trainer.adapter(esn)
         else:
-            es_latent, esn_latent = es, esn
+            es_lat, esn_lat = es, esn
 
-        from src.evaluation.metrics import m1_timelike_rate, m5_predictive_nll, m4_cone_alignment
-        m1 = m1_timelike_rate(trainer.metric, es_latent, esn_latent)
-        m5 = m5_predictive_nll(trainer.world_model, es_latent, esn_latent)
+        m1 = m1_timelike_rate(trainer.metric, es_lat, esn_lat)
+        m5 = m5_predictive_nll(trainer.world_model, es_lat, esn_lat)
 
-        print(f"\n--- D2 Results ({cfg.geometry}) ---")
-        print(f"M1 (time-likeness rate): {m1:.4f}")
-        print(f"M5 (predictive NLL):     {m5:.4f}")
-
+        # M4 cone alignment
         from src.training.candidates import build_candidate_set_c1
-        cands, _ = build_candidate_set_c1(es_latent[:256], esn_latent[:256], candidate_size=32)
-        m4 = m4_cone_alignment(trainer.metric, trainer.lagrangian, es_latent[:256], cands)
-        print(f"M4 (cone Jaccard):       {m4['jaccard']:.4f}")
-        print(f"M4 (cone precision):     {m4['precision']:.4f}")
-        print(f"M4 (cone recall):        {m4['recall']:.4f}")
+        from src.evaluation.metrics import m4_cone_alignment
+        n_ev = min(256, len(es_lat))
+        cands, _ = build_candidate_set_c1(es_lat[:n_ev], esn_lat[:n_ev], 32)
+        m4 = m4_cone_alignment(trainer.metric, trainer.lagrangian,
+                               es_lat[:n_ev], cands)
 
+    print(f"\n--- D2 Results ({cfg.geometry}) ---")
+    print(f"M1 (time-likeness rate): {m1:.4f}")
+    print(f"M4 (cone Jaccard):       {m4['jaccard']:.4f}")
+    print(f"M4 (cone precision):     {m4['precision']:.4f}")
+    print(f"M4 (cone recall):        {m4['recall']:.4f}")
+    print(f"M5 (predictive NLL):     {m5:.4f}")
+
+    # Save
     os.makedirs(cfg.output_dir, exist_ok=True)
-
-    neg_perm = torch.randperm(len(esn_latent))
-    plot_interval_histogram(
-        trainer.metric,
-        es_latent[:500], esn_latent[:500], esn_latent[neg_perm[:500]],
-        save_path=os.path.join(cfg.output_dir, f"d2_intervals_{cfg.geometry}.png"),
-        title=f"D2 WikiText Interval Distribution ({cfg.geometry})",
-    )
-    plot_training_curves(
-        history,
-        save_path=os.path.join(cfg.output_dir, f"d2_curves_{cfg.geometry}.png"),
-    )
-
-    trainer.save_checkpoint(os.path.join(cfg.checkpoint_dir, f"d2_{cfg.geometry}.pt"))
-
     results = {
-        "m1_timelike_rate": m1,
-        "m4_cone_jaccard": m4["jaccard"],
-        "m4_cone_precision": m4["precision"],
-        "m4_cone_recall": m4["recall"],
-        "m5_nll": m5,
-        "geometry": cfg.geometry,
-        "latent_dim": cfg.latent_dim,
-        "n_transitions": len(states),
-        "has_semantic_term": has_lm_scores,
+        "m1": m1, "m4_jaccard": m4["jaccard"],
+        "m4_precision": m4["precision"], "m4_recall": m4["recall"],
+        "m5": m5, "geometry": cfg.geometry, "has_semantic": has_lm,
     }
     with open(os.path.join(cfg.output_dir, f"d2_results_{cfg.geometry}.json"), "w") as f:
         json.dump(results, f, indent=2)
 
-    print(f"\nResults saved to {cfg.output_dir}/")
+    from src.evaluation.visualization import plot_training_curves, plot_interval_histogram
+    plot_training_curves(history,
+        save_path=os.path.join(cfg.output_dir, f"d2_curves_{cfg.geometry}.png"))
+    neg_perm = torch.randperm(len(esn_lat))
+    plot_interval_histogram(trainer.metric,
+        es_lat[:500], esn_lat[:500], esn_lat[neg_perm[:500]],
+        save_path=os.path.join(cfg.output_dir, f"d2_intervals_{cfg.geometry}.png"),
+        title=f"D2 WikiText Intervals ({cfg.geometry})")
+
+    trainer.save_checkpoint(os.path.join(cfg.checkpoint_dir, f"d2_{cfg.geometry}.pt"))
+    print(f"Results saved to {cfg.output_dir}/")
     return results
 
 
