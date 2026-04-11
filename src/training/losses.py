@@ -201,6 +201,7 @@ def compute_total_loss(
     precomputed_lsem_candidates: Optional[torch.Tensor] = None,
     cfg=None,
     stage: int = 2,
+    current_epoch: int = 0,
     dynamic_weights: Optional[dict] = None,
     time_fn=None,
 ) -> dict:
@@ -221,19 +222,23 @@ def compute_total_loss(
         rate_weight=getattr(cfg, 'cone_rate_weight', 1.0),
     )
 
-    if time_fn is not None:
+    # Future loss + tau gauge only activate in second half of Stage 2
+    # (lets the metric learn the cone structure first)
+    stage2_total = cfg.stage2_epochs if cfg else 50
+    future_active = (time_fn is not None) and (
+        (current_epoch >= stage2_total // 2) or (stage >= 3)
+    )
+
+    if future_active:
         from ..models.time_orientation import future_loss as _future_loss
         losses["future"] = _future_loss(
             time_fn, s, s_next,
             margin=cfg.future_margin if cfg else 0.1,
         )
-    else:
-        losses["future"] = torch.tensor(0.0, device=s.device)
-
-    if time_fn is not None:
         d_tau = time_fn.delta_tau(s, s_next)
         losses["tau_gauge"] = (d_tau.mean() - 1.0) ** 2 + (d_tau.var() - 0.25) ** 2
     else:
+        losses["future"] = torch.tensor(0.0, device=s.device)
         losses["tau_gauge"] = torch.tensor(0.0, device=s.device)
 
     losses["cond"] = condition_number_loss(metric, s)

@@ -200,6 +200,7 @@ class WorldModelTrainer:
                 precomputed_lsem=lsem if lsem.abs().sum() > 0 else None,
                 cfg=self.cfg,
                 stage=stage,
+                current_epoch=self.current_epoch,
                 dynamic_weights=self._dynamic_weights,
                 time_fn=self.time_fn,
             )
@@ -219,13 +220,20 @@ class WorldModelTrainer:
                     )
                 self.optimizer.step()
 
+            # Track time-like fraction for diagnostics
+            with torch.no_grad():
+                diag_intervals = self.metric.squared_interval(s, s_next - s)
+                batch_tl_frac = (diag_intervals < 0).float().mean().item()
+
             # Accumulate losses
             for k, v in losses.items():
                 epoch_losses[k] = epoch_losses.get(k, 0.0) + v.item()
             n_batches += 1
 
+        epoch_losses["timelike_frac"] = batch_tl_frac
+
         # Average
-        return {k: v / max(n_batches, 1) for k, v in epoch_losses.items()}
+        return {k: (v / max(n_batches, 1) if k != "timelike_frac" else v) for k, v in epoch_losses.items()}
 
     def train(
         self,
@@ -308,7 +316,7 @@ class WorldModelTrainer:
 
             # Progress bar
             desc = f"S{stage}"
-            for k in ["total", "cone", "future", "ml", "match"]:
+            for k in ["total", "cone", "future", "match", "timelike_frac"]:
                 if k in losses:
                     desc += f" | {k}={losses[k]:.4f}"
             pbar.set_description(desc)
