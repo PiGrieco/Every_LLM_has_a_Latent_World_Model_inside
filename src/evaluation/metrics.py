@@ -161,6 +161,64 @@ def m3_branching_separation(
     return spacelike_count / total_pairs
 
 
+def m3_prime_joint_branching(
+    metric,
+    trajectories_by_branch: dict,
+    prefix_length: int,
+) -> dict:
+    """
+    M3': Joint branching metric requiring BOTH within-branch time-like
+    AND cross-branch space-like. Only Lorentzian can achieve both.
+    """
+    within_intervals = []
+    for branch_id, trajs in trajectories_by_branch.items():
+        for traj in trajs:
+            post = traj[prefix_length:]
+            if len(post) < 2:
+                continue
+            s = post[:-1]
+            s_next = post[1:]
+            delta = s_next - s
+            intervals = metric.squared_interval(s, delta)
+            within_intervals.append(intervals)
+
+    if within_intervals:
+        all_within = torch.cat(within_intervals)
+        within_timelike = (all_within < 0).float().mean().item()
+    else:
+        within_timelike = 0.0
+
+    cross_intervals = []
+    branch_ids = sorted(trajectories_by_branch.keys())
+    for i, bid_a in enumerate(branch_ids):
+        for bid_b in branch_ids[i+1:]:
+            trajs_a = trajectories_by_branch[bid_a]
+            trajs_b = trajectories_by_branch[bid_b]
+            n_compare = min(len(trajs_a), len(trajs_b), 10)
+            for k in range(n_compare):
+                traj_a = trajs_a[k]
+                traj_b = trajs_b[k]
+                max_t = min(len(traj_a), len(traj_b))
+                for t in range(prefix_length + 1, max_t, 2):
+                    sa = traj_a[t].unsqueeze(0)
+                    sb = traj_b[t].unsqueeze(0)
+                    delta = sb - sa
+                    interval = metric.squared_interval(sa, delta)
+                    cross_intervals.append(interval)
+
+    if cross_intervals:
+        all_cross = torch.cat(cross_intervals)
+        cross_spacelike = (all_cross > 0).float().mean().item()
+    else:
+        cross_spacelike = 0.0
+
+    return {
+        "within_timelike_rate": within_timelike,
+        "cross_spacelike_rate": cross_spacelike,
+        "joint_score": within_timelike * cross_spacelike,
+    }
+
+
 def m4_cone_alignment(
     metric,
     lagrangian,

@@ -17,6 +17,7 @@ Low Lagrangian = smooth geometry + plausible semantics = high probability.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from .metric import MetricNetwork
 
 
@@ -138,9 +139,8 @@ class Lagrangian(nn.Module):
         total = self.lambda_g * L_g + self.lambda_sem * L_sem
 
         if self.time_fn is not None:
-            import torch.nn.functional as _F
             d_tau = self.time_fn.delta_tau(s, s_next)
-            L_future = _F.softplus(0.1 - d_tau)
+            L_future = F.softplus(0.1 - d_tau)
             total = total + self.lambda_future * L_future
 
         return total

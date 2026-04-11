@@ -74,7 +74,7 @@ def run_d0(cfg: Config):
     )
 
     # Extract transitions for training
-    states, next_states = extract_transitions(forward_ds)
+    states, next_states, t_indices, traj_indices = extract_transitions(forward_ds)
     print(f"Training transitions: {len(states)}")
 
     # Train/eval split (80/20)
@@ -205,7 +205,7 @@ def run_d1(cfg: Config):
     )
 
     # Extract transitions
-    states, next_states = extract_transitions(dataset)
+    states, next_states, t_indices, traj_indices = extract_transitions(dataset)
     print(f"Training transitions: {len(states)}")
 
     # Train/eval split
@@ -259,6 +259,26 @@ def run_d1(cfg: Config):
         m3 = np.mean(m3_rates)
         print(f"M3 (branching separation): {m3:.4f}")
 
+        # M3': Joint branching metric (distinguishes geometries)
+        from src.evaluation.metrics import m3_prime_joint_branching
+
+        trajs_per_branch = cfg.n_trajectories // cfg.n_branches
+        trajs_by_branch = {}
+        for b in range(cfg.n_branches):
+            trajs_by_branch[b] = []
+            for i in range(min(trajs_per_branch, 20)):
+                traj_idx = b * trajs_per_branch + i
+                trajs_by_branch[b].append(
+                    dataset[traj_idx]["trajectory"].to(device)
+                )
+
+        m3p = m3_prime_joint_branching(
+            trainer.metric, trajs_by_branch, cfg.prefix_length
+        )
+        print(f"M3' (within time-like):    {m3p['within_timelike_rate']:.4f}")
+        print(f"M3' (cross space-like):    {m3p['cross_spacelike_rate']:.4f}")
+        print(f"M3' (joint score):         {m3p['joint_score']:.4f}")
+
     # ---- Plots ----
     os.makedirs(cfg.output_dir, exist_ok=True)
 
@@ -284,6 +304,9 @@ def run_d1(cfg: Config):
     results = {
         "m1_timelike_rate": m1,
         "m3_branching_separation": m3,
+        "m3p_within_timelike": m3p["within_timelike_rate"],
+        "m3p_cross_spacelike": m3p["cross_spacelike_rate"],
+        "m3p_joint": m3p["joint_score"],
         "geometry": cfg.geometry,
         "n_branches": cfg.n_branches,
     }

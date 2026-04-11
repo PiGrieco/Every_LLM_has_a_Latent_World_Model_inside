@@ -86,6 +86,10 @@ class Config:
     lambda_causal: float = 1.0
     causal_margin: float = -0.1      # ε in the time-likeness loss (negative margin)
     cone_margin_outside: float = 0.1  # Margin for space-like constraint on negatives
+    cone_target_scale: float = 1.0    # Target for E[|Δσ²|] — prevents cone collapse/explosion
+    cone_scale_weight: float = 0.5    # Weight of scale regularizer in cone loss
+    cone_target_rate: float = 0.8     # Target fraction of time-like transitions
+    cone_rate_weight: float = 1.0     # Weight of rate regularizer in cone loss
     lambda_future: float = 0.5        # Weight for time orientation loss L_future
     future_margin: float = 0.1        # δ: minimum required τ increment per step
     # Stage 3 (+ world model matching)

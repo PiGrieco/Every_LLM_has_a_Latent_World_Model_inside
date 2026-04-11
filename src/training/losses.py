@@ -17,47 +17,39 @@ from typing import Optional
 from ..models.time_orientation import TimeOrientation, future_loss
 
 
-def contrastive_cone_loss(
+def cone_loss_with_scale_reg(
     metric,
     s: torch.Tensor,
     s_next: torch.Tensor,
     margin_inside: float = -0.1,
-    margin_outside: float = 0.1,
+    target_scale: float = 1.0,
+    scale_weight: float = 0.5,
+    target_timelike_rate: float = 0.8,
+    rate_weight: float = 1.0,
 ) -> torch.Tensor:
     """
-    Contrastive cone loss: push real transitions INSIDE the cone (time-like)
-    and push negatives OUTSIDE the cone (space-like).
+    Inside-only cone loss + scale regularization.
 
-    This prevents the "cone collapse" problem where the metric learns a
-    degenerate cone that encompasses everything.
+    Instead of forcing random negatives to be space-like (which creates
+    contradictory gradients when negatives are temporally displaced),
+    we use two stabilization mechanisms:
 
-    Args:
-        metric: MetricNetwork instance
-        s: (batch, D) current states
-        s_next: (batch, D) true next states
-        margin_inside: negative margin for time-like constraint
-        margin_outside: positive margin for space-like constraint
-
-    Returns:
-        loss: scalar, average contrastive cone loss
+    1. Inside-cone hinge: push real transitions to be time-like
+    2. Scale regularizer: penalize (E[|Δσ²|] - target_scale)²
+    3. Target time-like rate: penalize deviation from target fraction
     """
-    batch = s.shape[0]
+    delta_s = s_next - s
+    intervals = metric.squared_interval(s, delta_s)
 
-    delta_real = s_next - s
-    interval_real = metric.squared_interval(s, delta_real)
-    loss_inside = F.relu(interval_real - margin_inside).mean()
+    loss_inside = F.relu(intervals - margin_inside).mean()
 
-    perm = torch.randperm(batch, device=s.device)
-    s_neg = s_next[perm]
-    same_mask = (perm == torch.arange(batch, device=s.device))
-    if same_mask.any():
-        s_neg[same_mask] = s_next[(perm[same_mask] + 1) % batch]
+    mean_abs_interval = intervals.abs().mean()
+    loss_scale = (mean_abs_interval - target_scale) ** 2
 
-    delta_neg = s_neg - s
-    interval_neg = metric.squared_interval(s, delta_neg)
-    loss_outside = F.relu(margin_outside - interval_neg).mean()
+    actual_rate = (intervals < 0).float().mean()
+    loss_rate = (actual_rate - target_timelike_rate) ** 2
 
-    return loss_inside + loss_outside
+    return loss_inside + scale_weight * loss_scale + rate_weight * loss_rate
 
 
 def smoothness_loss(
@@ -213,53 +205,51 @@ def compute_total_loss(
     time_fn=None,
 ) -> dict:
     """
-    Compute the total loss for a training step, respecting staged training.
+    Total loss with staged training.
 
-    Stage 2: L_cone_contrastive + L_future + L_cond
-    Stage 3: L_cone_contrastive + L_future + L_match + L_ML + L_cond
-
-    The contrastive cone loss replaces the old one-sided time-likeness loss,
-    preventing cone collapse. The future loss (from τ_θ) breaks time-reversal
-    symmetry in the energy, making M2(action gap) a meaningful probe.
+    Stage 2: cone_loss + future_loss + tau_gauge + cond_reg
+    Stage 3: cone_loss + future_loss + tau_gauge + cond_reg + match_loss
     """
     losses = {}
 
-    losses["cone"] = contrastive_cone_loss(
+    losses["cone"] = cone_loss_with_scale_reg(
         metric, s, s_next,
         margin_inside=cfg.causal_margin if cfg else -0.1,
-        margin_outside=cfg.cone_margin_outside if cfg else 0.1,
+        target_scale=getattr(cfg, 'cone_target_scale', 1.0),
+        scale_weight=getattr(cfg, 'cone_scale_weight', 0.5),
+        target_timelike_rate=getattr(cfg, 'cone_target_rate', 0.8),
+        rate_weight=getattr(cfg, 'cone_rate_weight', 1.0),
     )
 
     if time_fn is not None:
-        losses["future"] = future_loss(
+        from ..models.time_orientation import future_loss as _future_loss
+        losses["future"] = _future_loss(
             time_fn, s, s_next,
             margin=cfg.future_margin if cfg else 0.1,
         )
     else:
         losses["future"] = torch.tensor(0.0, device=s.device)
 
-    losses["cond"] = condition_number_loss(metric, s) * 0.1
+    if time_fn is not None:
+        d_tau = time_fn.delta_tau(s, s_next)
+        losses["tau_gauge"] = (d_tau.mean() - 1.0) ** 2 + (d_tau.var() - 0.25) ** 2
+    else:
+        losses["tau_gauge"] = torch.tensor(0.0, device=s.device)
+
+    losses["cond"] = condition_number_loss(metric, s)
 
     if stage >= 3:
-        losses["ml"] = maximum_likelihood_loss(world_model, s, s_next)
-
         losses["match"] = candidate_set_matching_loss(
             lagrangian, world_model, s, candidates,
             precomputed_lsem=precomputed_lsem_candidates,
         )
 
-        if s_prev is not None:
-            losses["smooth"] = smoothness_loss(s_prev, s, s_next)
-        else:
-            losses["smooth"] = torch.tensor(0.0, device=s.device)
-
     lam = {
         "cone": cfg.lambda_geo if cfg else 0.5,
         "future": cfg.lambda_future if cfg else 0.5,
+        "tau_gauge": 1.0,
         "cond": 0.1,
-        "ml": cfg.lambda_wm if cfg else 1.0,
         "match": cfg.lambda_match if cfg else 1.0,
-        "smooth": cfg.lambda_smooth if cfg else 0.1,
     }
     if dynamic_weights is not None:
         lam.update(dynamic_weights)
@@ -292,7 +282,7 @@ def calibrate_loss_weights(
     Returns:
         weights: dict of loss_name -> recommended λ
     """
-    l_cone = contrastive_cone_loss(metric, s, s_next)
+    l_cone = cone_loss_with_scale_reg(metric, s, s_next)
     l_ml = maximum_likelihood_loss(world_model, s, s_next)
     l_match = candidate_set_matching_loss(lagrangian, world_model, s, candidates)
 

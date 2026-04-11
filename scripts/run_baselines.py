@@ -136,18 +136,21 @@ def main():
         print(f"{geo:<15} {m1_s:<18} {m2a_s:<18} {m2l_s:<18}")
 
     print("\nD1 — Branching (H3):")
-    print(f"{'Geometry':<15} {'M1 (timelike)':<18} {'M3 (branch sep)':<18}")
-    print("-" * 51)
+    print(f"{'Geometry':<15} {'M1 (timelike)':<18} {'M3 (old)':<12} {'M3p within':<14} {'M3p cross':<14} {'M3p joint':<14}")
+    print("-" * 87)
     for geo in geometries:
         r = d1_results.get(geo, {})
         if "error" in r:
             print(f"{geo:<15} {'ERROR':<18} {r['error'][:36]}")
             continue
+        def fmt(v):
+            return f"{v:.4f}" if isinstance(v, float) else str(v)
         m1 = r.get("m1_timelike_rate", "N/A")
         m3 = r.get("m3_branching_separation", "N/A")
-        m1_s = f"{m1:.4f}" if isinstance(m1, float) else m1
-        m3_s = f"{m3:.4f}" if isinstance(m3, float) else m3
-        print(f"{geo:<15} {m1_s:<18} {m3_s:<18}")
+        m3w = r.get("m3p_within_timelike", "N/A")
+        m3c = r.get("m3p_cross_spacelike", "N/A")
+        m3j = r.get("m3p_joint", "N/A")
+        print(f"{geo:<15} {fmt(m1):<18} {fmt(m3):<12} {fmt(m3w):<14} {fmt(m3c):<14} {fmt(m3j):<14}")
 
     # Save all results
     os.makedirs("./outputs", exist_ok=True)

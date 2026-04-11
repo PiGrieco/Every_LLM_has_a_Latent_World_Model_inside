@@ -105,7 +105,7 @@ def generate_d1(
     dim: int = 16,
     drift_strength: float = 0.5,
     noise_std: float = 0.1,
-    branch_spread: float = 1.0,
+    branch_spread: float = 0.2,
     seed: int = 42,
 ) -> Tuple[SyntheticTrajectoryDataset, dict]:
     """
@@ -186,20 +186,32 @@ def generate_d1(
     return SyntheticTrajectoryDataset(trajectories, labels), branch_info
 
 
-def extract_transitions(dataset: SyntheticTrajectoryDataset) -> Tuple[torch.Tensor, torch.Tensor]:
+def extract_transitions(dataset: SyntheticTrajectoryDataset) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """
     Extract all consecutive (s_t, s_{t+1}) pairs from a trajectory dataset.
 
     Returns:
         states: (N_total, D) tensor of current states
         next_states: (N_total, D) tensor of next states
+        t_indices: (N_total,) tensor of time step indices (position within trajectory)
+        traj_indices: (N_total,) tensor of trajectory indices (which trajectory)
     """
     all_s = []
     all_s_next = []
+    all_t = []
+    all_traj = []
 
-    for item in dataset:
+    for idx, item in enumerate(dataset):
         traj = item["trajectory"]  # (T, D)
+        T = len(traj)
         all_s.append(traj[:-1])
         all_s_next.append(traj[1:])
+        all_t.append(torch.arange(T - 1))
+        all_traj.append(torch.full((T - 1,), idx))
 
-    return torch.cat(all_s, dim=0), torch.cat(all_s_next, dim=0)
+    return (
+        torch.cat(all_s, dim=0),
+        torch.cat(all_s_next, dim=0),
+        torch.cat(all_t, dim=0),
+        torch.cat(all_traj, dim=0),
+    )
