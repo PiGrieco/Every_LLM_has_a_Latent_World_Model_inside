@@ -112,6 +112,7 @@ class WorldModelTrainer:
         self.current_epoch = 0
         self.knn_index = None
         self.all_states_cache = None
+        self.raw_states_cache = None
         self._dynamic_weights = None
         self.history = {"epoch": [], "stage": []}
 
@@ -134,6 +135,7 @@ class WorldModelTrainer:
         to get latent-space states for kNN (since energy is computed in
         latent space, neighbors must be found there too).
         """
+        self.raw_states_cache = states.detach().cpu()
         with torch.no_grad():
             if not isinstance(self.adapter, IdentityAdapter):
                 raw = states.to(self.device)
@@ -144,6 +146,23 @@ class WorldModelTrainer:
             else:
                 self.all_states_cache = states.to(self.device)
 
+    def _refresh_all_states_cache(self):
+        """Recompute latent cache using current adapter weights.
+        Essential for D2 with C2 kNN candidates — without this,
+        neighbors are computed in a stale latent space."""
+        if self.raw_states_cache is None:
+            return
+        if isinstance(self.adapter, IdentityAdapter):
+            self.all_states_cache = self.raw_states_cache.to(self.device)
+            return
+        with torch.no_grad():
+            raw = self.raw_states_cache
+            chunks = []
+            for i in range(0, len(raw), 4096):
+                x = raw[i:i+4096].to(self.device)
+                chunks.append(self.adapter(x))
+            self.all_states_cache = torch.cat(chunks, dim=0)
+
     def _maybe_rebuild_knn(self, epoch: int):
         """Rebuild kNN index periodically for C2 candidates."""
         if (
@@ -151,6 +170,7 @@ class WorldModelTrainer:
             and self.all_states_cache is not None
             and (epoch % self.cfg.knn_rebuild_every == 0 or self.knn_index is None)
         ):
+            self._refresh_all_states_cache()
             try:
                 self.knn_index = build_faiss_index(self.all_states_cache)
             except ImportError:

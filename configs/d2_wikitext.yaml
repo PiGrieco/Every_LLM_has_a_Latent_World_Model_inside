@@ -60,6 +60,7 @@ lambda_match: 1.0
 lambda_smooth: 0.1
 lambda_wm: 1.0
 lambda_geo: 0.5
+lambda_future: 0.0         # Disable for first run; enable after metric stabilizes
 causal_margin: -0.1
 
 # Training — longer for real data
