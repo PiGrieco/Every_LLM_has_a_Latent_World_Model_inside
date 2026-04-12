@@ -413,9 +413,19 @@ class WorldModelTrainer:
         """Compute M1-M6 on held-out transitions."""
         self.metric.eval()
         self.world_model.eval()
+        self.adapter.eval()
 
         s = states.to(self.device)
         s_next = next_states.to(self.device)
+
+        if not isinstance(self.adapter, IdentityAdapter):
+            s_chunks, sn_chunks = [], []
+            chunk_size = 4096
+            for i in range(0, len(s), chunk_size):
+                s_chunks.append(self.adapter(s[i:i+chunk_size]))
+                sn_chunks.append(self.adapter(s_next[i:i+chunk_size]))
+            s = torch.cat(s_chunks, dim=0)
+            s_next = torch.cat(sn_chunks, dim=0)
 
         return compute_all_metrics(
             metric=self.metric,

@@ -482,9 +482,23 @@ def main():
 
     args = parser.parse_args()
 
-    # Build config
+    # Build config — CLI args override YAML when explicitly provided
     if args.config:
         cfg = Config.from_yaml(args.config)
+        if '--geometry' in sys.argv:
+            cfg.geometry = args.geometry
+        if '--dataset' in sys.argv:
+            cfg.dataset = args.dataset
+        if '--latent_dim' in sys.argv:
+            cfg.latent_dim = args.latent_dim
+        if '--stage2_epochs' in sys.argv:
+            cfg.stage2_epochs = args.stage2_epochs
+        if '--stage3_epochs' in sys.argv:
+            cfg.stage3_epochs = args.stage3_epochs
+        if '--seed' in sys.argv:
+            cfg.seed = args.seed
+        if '--output_dir' in sys.argv:
+            cfg.output_dir = args.output_dir
     else:
         cfg = Config(
             dataset=args.dataset,
