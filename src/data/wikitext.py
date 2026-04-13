@@ -65,25 +65,31 @@ def load_wikitext_articles(
     """
     Load WikiText-103 and split into (title, [paragraphs]).
 
-    WikiText-103 is stored as a flat list of lines. Articles are separated
-    by lines starting with ' = ' (level-1 headings). Paragraphs are
-    non-empty lines within an article.
+    When max_articles is set, uses streaming mode to avoid downloading
+    the full ~500MB dataset — only reads what's needed.
     """
     from datasets import load_dataset
 
-    ds = load_dataset("wikitext", "wikitext-103-raw-v1", split=split)
-    text_lines = ds["text"]
+    use_streaming = max_articles is not None and max_articles < 5000
+    ds = load_dataset(
+        "wikitext", "wikitext-103-raw-v1",
+        split=split,
+        streaming=use_streaming,
+    )
+
+    if use_streaming:
+        text_iter = (row["text"] for row in ds)
+    else:
+        text_iter = ds["text"]
 
     articles = []
     current_title = ""
     current_paragraphs = []
 
-    for line in text_lines:
+    for line in text_iter:
         line = line.strip()
 
-        # Detect article boundaries: level-1 heading (e.g., " = Title = ")
         if line.startswith("= ") and line.endswith(" =") and not line.startswith("= ="):
-            # Save previous article if it has enough paragraphs
             if current_paragraphs and min_paragraphs <= len(current_paragraphs) <= max_paragraphs:
                 articles.append((current_title, current_paragraphs))
                 if max_articles and len(articles) >= max_articles:
@@ -93,12 +99,11 @@ def load_wikitext_articles(
             current_paragraphs = []
 
         elif len(line) > 50:
-            # Only keep substantial paragraphs (> 50 chars filters noise)
             current_paragraphs.append(line)
 
-    # Don't forget last article
-    if current_paragraphs and min_paragraphs <= len(current_paragraphs) <= max_paragraphs:
-        articles.append((current_title, current_paragraphs))
+    if (not max_articles or len(articles) < max_articles):
+        if current_paragraphs and min_paragraphs <= len(current_paragraphs) <= max_paragraphs:
+            articles.append((current_title, current_paragraphs))
 
     return articles
 
