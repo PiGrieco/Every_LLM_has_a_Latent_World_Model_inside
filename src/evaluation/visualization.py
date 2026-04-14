@@ -43,7 +43,22 @@ def plot_interval_histogram(
         delta_neg = s_neg - s
         intervals_neg = metric.squared_interval(s, delta_neg).cpu().numpy()
 
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    # Handle degenerate distributions (all same sign)
+    all_vals = np.concatenate([intervals_real, intervals_neg])
+    val_range = all_vals.max() - all_vals.min()
+    if val_range < 1e-8:
+        ax.text(0.5, 0.5, "All intervals identical (degenerate metric)",
+                transform=ax.transAxes, ha="center", va="center", fontsize=14)
+        ax.set_title(title, fontsize=14)
+        plt.savefig(save_path, dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"Saved (degenerate): {save_path}")
+        return
+
+    real_tl = (intervals_real < 0).mean()
+    neg_tl = (intervals_neg < 0).mean()
 
     ax.hist(intervals_real, bins=80, alpha=0.6, label="Real transitions",
             color="#2196F3", density=True)
@@ -56,13 +71,18 @@ def plot_interval_histogram(
     ax.set_title(title, fontsize=14)
     ax.legend(fontsize=11)
 
-    # Annotate regions
-    ax.text(-0.5, ax.get_ylim()[1] * 0.85, "← Time-like", fontsize=10, ha="center",
-            color="#2196F3", weight="bold")
-    ax.text(0.5, ax.get_ylim()[1] * 0.85, "Space-like →", fontsize=10, ha="center",
-            color="#FF5722", weight="bold")
+    # Annotate with time-like fractions
+    ylim = ax.get_ylim()[1]
+    if ylim > 0:
+        ax.text(0.02, 0.92, f"Real time-like: {real_tl:.1%}",
+                transform=ax.transAxes, fontsize=10, color="#2196F3", weight="bold")
+        ax.text(0.02, 0.85, f"Neg time-like: {neg_tl:.1%}",
+                transform=ax.transAxes, fontsize=10, color="#FF5722", weight="bold")
 
-    plt.tight_layout()
+    try:
+        plt.tight_layout()
+    except Exception:
+        plt.subplots_adjust(left=0.1, right=0.95, top=0.9, bottom=0.12)
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved: {save_path}")

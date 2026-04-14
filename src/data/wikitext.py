@@ -185,7 +185,7 @@ def compute_lm_log_probs(
     # Check cache
     if cache_path and Path(cache_path).exists():
         print(f"Loading cached LM scores from {cache_path}")
-        data = torch.load(cache_path)
+        data = torch.load(cache_path, weights_only=False)
         return data["log_probs"]
 
     from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -196,51 +196,109 @@ def compute_lm_log_probs(
     model = AutoModelForCausalLM.from_pretrained(lm_name).to(device)
     model.eval()
 
-    all_log_probs = []
+    max_positions = getattr(model.config, 'n_positions', 1024)
 
-    for title, paragraphs in tqdm(articles, desc="Computing LM log-probs"):
+    all_log_probs = []
+    n_skipped = 0
+    n_computed = 0
+
+    # Resume from partial results if available
+    partial_path = str(cache_path) + ".partial" if cache_path else None
+    start_idx = 0
+    if partial_path and Path(partial_path).exists():
+        partial = torch.load(partial_path, weights_only=False)
+        all_log_probs = partial["log_probs"]
+        start_idx = len(all_log_probs)
+        print(f"  Resuming from article {start_idx}/{len(articles)}")
+
+    for art_idx, (title, paragraphs) in enumerate(
+        tqdm(articles, desc="Computing LM log-probs")
+    ):
+        if art_idx < start_idx:
+            continue
+
         article_logprobs = []
 
         for t in range(len(paragraphs) - 1):
-            # Context: concatenation of paragraphs 0..t
             context = " ".join(paragraphs[: t + 1])
             continuation = " " + paragraphs[t + 1]
 
-            # Tokenize context + continuation together
             context_ids = tokenizer.encode(context, add_special_tokens=False)
             cont_ids = tokenizer.encode(continuation, add_special_tokens=False)
 
-            # Truncate context from the left to fit max_context
-            max_ctx_len = max_context - len(cont_ids)
+            # Truncate continuation if it alone exceeds the window
+            if len(cont_ids) > max_positions - 10:
+                cont_ids = cont_ids[: max_positions - 10]
+
+            # Truncate context from the left to fit
+            max_ctx_len = min(max_context, max_positions - len(cont_ids))
             if max_ctx_len < 10:
                 max_ctx_len = 10
             context_ids = context_ids[-max_ctx_len:]
 
-            input_ids = torch.tensor([context_ids + cont_ids], device=device)
+            input_ids = torch.tensor(
+                [context_ids + cont_ids], device=device
+            )
+
+            # Hard guard: clamp to model's positional embedding size
+            if input_ids.shape[1] > max_positions:
+                input_ids = input_ids[:, -max_positions:]
+                context_ids = context_ids[-(max_positions - len(cont_ids)):]
+
             ctx_len = len(context_ids)
 
-            with torch.no_grad():
-                outputs = model(input_ids)
-                logits = outputs.logits  # (1, seq_len, vocab_size)
+            try:
+                with torch.no_grad():
+                    outputs = model(input_ids)
+                    logits = outputs.logits
 
-                # Compute log-prob of each continuation token
-                # logits[0, ctx_len-1:-1] predicts tokens at positions ctx_len..end
-                log_probs_per_token = torch.log_softmax(logits[0, ctx_len - 1 : -1], dim=-1)
-                target_ids = input_ids[0, ctx_len:]
-                token_log_probs = log_probs_per_token.gather(1, target_ids.unsqueeze(1)).squeeze(1)
+                    log_probs_per_token = torch.log_softmax(
+                        logits[0, ctx_len - 1 : -1], dim=-1
+                    )
+                    target_ids = input_ids[0, ctx_len:]
+                    token_log_probs = log_probs_per_token.gather(
+                        1, target_ids.unsqueeze(1)
+                    ).squeeze(1)
 
-                # Average negative log-probability (the semantic cost)
-                neg_log_prob = -token_log_probs.mean().item()
+                    neg_log_prob = -token_log_probs.mean().item()
+                n_computed += 1
+            except Exception as e:
+                neg_log_prob = float("nan")
+                n_skipped += 1
+                if n_skipped <= 5:
+                    print(f"  [WARN] Skipped transition (article={art_idx}, t={t}): {e}")
 
             article_logprobs.append(neg_log_prob)
 
         all_log_probs.append(torch.tensor(article_logprobs))
 
-    # Cache
+        # Periodic VRAM cleanup + partial save
+        if (art_idx + 1) % 500 == 0:
+            if device != "cpu":
+                torch.cuda.empty_cache()
+            if partial_path:
+                torch.save({"log_probs": all_log_probs}, partial_path)
+
+    # Replace NaN scores with the dataset median
+    all_valid = [v for lp in all_log_probs for v in lp.tolist() if not np.isnan(v)]
+    if all_valid:
+        median_score = float(np.median(all_valid))
+        for i, lp in enumerate(all_log_probs):
+            nan_mask = torch.isnan(lp)
+            if nan_mask.any():
+                lp[nan_mask] = median_score
+                all_log_probs[i] = lp
+
+    print(f"  LM scoring complete: {n_computed} computed, {n_skipped} skipped")
+
+    # Cache final results
     if cache_path:
         Path(cache_path).parent.mkdir(parents=True, exist_ok=True)
         torch.save({"log_probs": all_log_probs}, cache_path)
         print(f"Cached LM scores to {cache_path}")
+    # Clean up partial file
+    if partial_path and Path(partial_path).exists():
+        Path(partial_path).unlink()
 
     return all_log_probs
 

@@ -116,6 +116,21 @@ class WorldModelTrainer:
         self._dynamic_weights = None
         self.history = {"epoch": [], "stage": []}
 
+    @torch.no_grad()
+    def _to_latent(self, x: torch.Tensor, chunk_size: int = 4096) -> torch.Tensor:
+        """Project raw states through adapter to latent space. Identity for D0/D1."""
+        x = x.to(self.device)
+        if isinstance(self.adapter, IdentityAdapter):
+            return x
+        chunks = []
+        for i in range(0, len(x), chunk_size):
+            chunks.append(self.adapter(x[i:i + chunk_size]))
+        result = torch.cat(chunks, dim=0)
+        assert result.shape[-1] == self.cfg.latent_dim, (
+            f"_to_latent: expected dim {self.cfg.latent_dim}, got {result.shape[-1]}"
+        )
+        return result
+
     def _prepare_data(self, states, next_states, lsem=None):
         """Create a DataLoader from transition tensors."""
         tensors = [states, next_states]
@@ -294,15 +309,9 @@ class WorldModelTrainer:
         # fundamentally wrong (wrong η, dimension mismatch, etc.)
         with torch.no_grad():
             self.metric.eval()
-            sample_s = states[:min(1000, len(states))].to(self.device)
-            sample_sn = next_states[:min(1000, len(next_states))].to(self.device)
-            # Apply adapter if needed
-            if not isinstance(self.adapter, IdentityAdapter):
-                sample_s_lat = self.adapter(sample_s)
-                sample_sn_lat = self.adapter(sample_sn)
-            else:
-                sample_s_lat = sample_s
-                sample_sn_lat = sample_sn
+            n_sample = min(1000, len(states))
+            sample_s_lat = self._to_latent(states[:n_sample])
+            sample_sn_lat = self._to_latent(next_states[:n_sample])
             delta = sample_sn_lat - sample_s_lat
             init_intervals = self.metric.squared_interval(sample_s_lat, delta)
             init_m1 = (init_intervals < 0).float().mean().item()
@@ -415,8 +424,8 @@ class WorldModelTrainer:
         self.world_model.eval()
         self.adapter.eval()
 
-        s = states.to(self.device)
-        s_next = next_states.to(self.device)
+        s = self._to_latent(states)
+        s_next = self._to_latent(next_states)
 
         if not isinstance(self.adapter, IdentityAdapter):
             s_chunks, sn_chunks = [], []

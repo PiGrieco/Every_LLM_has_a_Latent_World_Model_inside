@@ -367,10 +367,15 @@ def run_d2(cfg):
         lm_data = torch.load(lm_path, weights_only=False)
         lm_scores = lm_data["log_probs"]
         print(f"  {sum(len(s) for s in lm_scores)} transition scores")
+    elif cfg.lambda_sem > 0:
+        raise FileNotFoundError(
+            f"Config has lambda_sem={cfg.lambda_sem} but {lm_path} not found.\n"
+            f"Run 'python -m scripts.encode_corpus --config configs/d2_wikitext.yaml' "
+            f"first, or pass --no-semantic to train without the LM term."
+        )
     else:
-        print("No LM scores — running without semantic term")
+        print("No LM scores and lambda_sem=0 — running without semantic term")
         lm_scores = None
-        cfg.lambda_sem = 0.0
 
     # Preprocess
     print("Preprocessing embeddings...")
@@ -418,12 +423,8 @@ def run_d2(cfg):
     trainer.adapter.eval()
 
     with torch.no_grad():
-        es, esn = eval_s.to(device), eval_sn.to(device)
-        if hasattr(trainer.adapter, 'net'):
-            es_lat = trainer.adapter(es)
-            esn_lat = trainer.adapter(esn)
-        else:
-            es_lat, esn_lat = es, esn
+        es_lat = trainer._to_latent(eval_s)
+        esn_lat = trainer._to_latent(eval_sn)
 
         m1 = m1_timelike_rate(trainer.metric, es_lat, esn_lat)
         m5 = m5_predictive_nll(trainer.world_model, es_lat, esn_lat)
@@ -479,6 +480,8 @@ def main():
     parser.add_argument("--stage3_epochs", type=int, default=100)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output_dir", type=str, default="./outputs")
+    parser.add_argument("--no-semantic", action="store_true",
+                        help="Disable semantic term (set lambda_sem=0) for D2")
 
     args = parser.parse_args()
 
@@ -531,6 +534,10 @@ def main():
     else:
         cfg.device = "cpu"
         print("Using CPU (training will be slower)")
+
+    if getattr(args, 'no_semantic', False):
+        cfg.lambda_sem = 0.0
+        print("  --no-semantic: lambda_sem forced to 0.0")
 
     set_seed(cfg.seed)
 
