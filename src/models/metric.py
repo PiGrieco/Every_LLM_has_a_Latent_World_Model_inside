@@ -117,9 +117,13 @@ class MetricNetwork(nn.Module):
         # consistent sign convention across the batch. This is analogous
         # to choosing a time orientation on a Lorentzian manifold — not
         # cheating, just picking a convention.
+        # Uses a mask to avoid in-place operations that break autograd.
         if self.geometry == "lorentzian":
-            A_met = A_met.clone()
-            A_met[:, 0, 0] = F.softplus(A_met[:, 0, 0]) + 1e-3
+            mask = torch.zeros_like(A_met)
+            mask[:, 0, 0] = 1.0
+            a00_old = A_met[:, 0, 0]
+            a00_new = F.softplus(a00_old) + 1e-3
+            A_met = A_met + mask * (a00_new - a00_old).unsqueeze(-1).unsqueeze(-1)
 
         return A_met
 
