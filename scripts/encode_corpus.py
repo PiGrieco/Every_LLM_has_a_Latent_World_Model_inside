@@ -71,9 +71,17 @@ def main():
     )
     print(f"  → {len(articles)} articles loaded")
 
-    # Save article metadata
+    # Save article metadata + train/eval split indices
     meta = [{"title": t, "n_paragraphs": len(p)} for t, p in articles]
     torch.save(meta, os.path.join(cfg.cache_dir, "wikitext_metadata.pt"))
+
+    # Article-level 80/20 split (for non-circular M4 evaluation)
+    n_articles = len(articles)
+    perm = torch.randperm(n_articles).tolist()
+    n_train = int(0.8 * n_articles)
+    split = {"train_indices": perm[:n_train], "eval_indices": perm[n_train:]}
+    torch.save(split, os.path.join(cfg.cache_dir, "wikitext_split.pt"))
+    print(f"  → Article split: {n_train} train / {n_articles - n_train} eval")
 
     # ---- Step 2: Encode paragraphs ----
     print("\nStep 2/4: Encoding paragraphs with sentence-transformer...")

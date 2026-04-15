@@ -86,6 +86,7 @@ class WorldModelTrainer:
             geometry=cfg.geometry,
             hidden_dim=64,
             n_layers=2,
+            mode=getattr(cfg, 'time_orientation_mode', 'auto'),
         ).to(self.device)
         self.lagrangian.set_time_orientation(self.time_fn, cfg.lambda_future)
 
@@ -98,8 +99,8 @@ class WorldModelTrainer:
             + list(self.lagrangian.parameters())
             + list(self.world_model.parameters())
         )
-        # Only add time_fn params for non-Lorentzian (fallback MLP)
-        if cfg.geometry != "lorentzian" and hasattr(self.time_fn, 'fallback_mlp'):
+        # Only add time_fn params when it has a fallback MLP (not in frame mode)
+        if hasattr(self.time_fn, 'fallback_mlp'):
             all_params += list(self.time_fn.parameters())
         seen = {}
         for p in all_params:

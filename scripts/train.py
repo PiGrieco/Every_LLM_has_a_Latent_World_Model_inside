@@ -120,17 +120,11 @@ def run_d0(cfg: Config):
             print(f"M2 (Δτ forward):  {m2['delta_tau_forward']:.4f}")
             print(f"M2 (Δτ reversed): {m2['delta_tau_reversed']:.4f}")
 
-        # Decompose action gap: geometry-only vs total
-        # Disable τ term, recompute action gap
-        orig_lf = trainer.lagrangian.lambda_future
-        trainer.lagrangian.lambda_future = 0.0
-        m2_geo = m2_time_reversal_gap(
-            trainer.metric, trainer.lagrangian, trainer.world_model,
-            fwd_trajs[:50], rev_trajs[:50],
-            time_fn=trainer.time_fn,
-        )
-        trainer.lagrangian.lambda_future = orig_lf
-        print(f"M2 (geometry-only action gap): {m2_geo['action_gap']:.4f}")
+        # Decomposition (now computed inside m2_time_reversal_gap)
+        if "geo_only_gap" in m2:
+            print(f"M2 (geo-only Δσ² gap):  {m2['geo_only_gap']:.4f}")
+        if "future_only_gap" in m2:
+            print(f"M2 (Δτ-only gap):       {m2['future_only_gap']:.4f}")
 
     # ---- Plots ----
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -185,6 +179,10 @@ def run_d0(cfg: Config):
     if "delta_tau_forward" in m2:
         results["m2_delta_tau_forward"] = m2["delta_tau_forward"]
         results["m2_delta_tau_reversed"] = m2["delta_tau_reversed"]
+    if "geo_only_gap" in m2:
+        results["m2_geo_only_gap"] = m2["geo_only_gap"]
+    if "future_only_gap" in m2:
+        results["m2_future_only_gap"] = m2["future_only_gap"]
     with open(os.path.join(cfg.output_dir, f"d0_results_{cfg.geometry}.json"), "w") as f:
         json.dump(results, f, indent=2)
 
@@ -385,38 +383,53 @@ def run_d2(cfg):
         normalize=cfg.normalize_embeddings,
     )
 
-    # Extract transitions
-    all_s, all_sn, all_lsem = [], [], []
-    for i, emb in enumerate(processed):
-        if len(emb) < 2:
-            continue
-        all_s.append(emb[:-1])
-        all_sn.append(emb[1:])
-        if lm_scores is not None and i < len(lm_scores):
-            all_lsem.append(lm_scores[i])
-        else:
-            all_lsem.append(torch.zeros(len(emb) - 1))
+    # Article-level split for non-circular evaluation:
+    # M4 is computed on articles never seen during training.
+    split_path = cache_dir / "wikitext_split.pt"
+    if split_path.exists():
+        split_data = torch.load(split_path, weights_only=False)
+        train_arts = set(split_data["train_indices"])
+        eval_arts = set(split_data["eval_indices"])
+        print(f"  Using article-level split: {len(train_arts)} train / {len(eval_arts)} eval articles")
+    else:
+        n_art = len(processed)
+        perm_art = torch.randperm(n_art).tolist()
+        n_train_art = int(0.8 * n_art)
+        train_arts = set(perm_art[:n_train_art])
+        eval_arts = set(perm_art[n_train_art:])
+        print(f"  No split file — created random split: {len(train_arts)}/{len(eval_arts)}")
 
-    states = torch.cat(all_s, dim=0)
-    next_states = torch.cat(all_sn, dim=0)
-    lsem = torch.cat(all_lsem, dim=0)
-    print(f"Total transitions: {len(states)}")
+    def _extract_transitions(indices):
+        ss, sn, ls = [], [], []
+        for i in indices:
+            if i >= len(processed):
+                continue
+            emb = processed[i]
+            if len(emb) < 2:
+                continue
+            ss.append(emb[:-1])
+            sn.append(emb[1:])
+            if lm_scores is not None and i < len(lm_scores):
+                ls.append(lm_scores[i])
+            else:
+                ls.append(torch.zeros(len(emb) - 1))
+        if not ss:
+            return None, None, None
+        return torch.cat(ss), torch.cat(sn), torch.cat(ls)
 
-    # Train/eval split
-    n = len(states)
-    perm = torch.randperm(n)
-    n_train = int(0.9 * n)
-    train_s, eval_s = states[perm[:n_train]], states[perm[n_train:]]
-    train_sn, eval_sn = next_states[perm[:n_train]], next_states[perm[n_train:]]
-    train_lsem = lsem[perm[:n_train]]
-    cfg.encoder_dim = states.shape[1]
+    train_s, train_sn, train_lsem = _extract_transitions(sorted(train_arts))
+    eval_s, eval_sn, _ = _extract_transitions(sorted(eval_arts))
+    print(f"  Train transitions: {len(train_s)} | Eval transitions: {len(eval_s)}")
+
+    cfg.encoder_dim = train_s.shape[1]
 
     # Train
     trainer = WorldModelTrainer(cfg)
     history = trainer.train(train_s, train_sn, lsem=train_lsem,
                             eval_states=eval_s, eval_next_states=eval_sn)
 
-    # Evaluate in latent space
+    # Evaluate on held-out ARTICLES (not just held-out transitions)
+    # This makes M4 non-circular: the eval articles were never seen during training.
     device = trainer.device
     trainer.metric.eval()
     trainer.world_model.eval()
@@ -429,7 +442,7 @@ def run_d2(cfg):
         m1 = m1_timelike_rate(trainer.metric, es_lat, esn_lat)
         m5 = m5_predictive_nll(trainer.world_model, es_lat, esn_lat)
 
-        # M4 cone alignment
+        # M4 cone alignment on held-out articles
         from src.training.candidates import build_candidate_set_c1
         from src.evaluation.metrics import m4_cone_alignment
         n_ev = min(256, len(es_lat))
@@ -439,7 +452,7 @@ def run_d2(cfg):
 
     print(f"\n--- D2 Results ({cfg.geometry}) ---")
     print(f"M1 (time-likeness rate): {m1:.4f}")
-    print(f"M4 (cone Jaccard):       {m4['jaccard']:.4f}")
+    print(f"M4 (cone Jaccard):       {m4['jaccard']:.4f}  [held-out articles]")
     print(f"M4 (cone precision):     {m4['precision']:.4f}")
     print(f"M4 (cone recall):        {m4['recall']:.4f}")
     print(f"M5 (predictive NLL):     {m5:.4f}")
@@ -450,6 +463,7 @@ def run_d2(cfg):
         "m1": m1, "m4_jaccard": m4["jaccard"],
         "m4_precision": m4["precision"], "m4_recall": m4["recall"],
         "m5": m5, "geometry": cfg.geometry, "has_semantic": has_lm,
+        "eval_on_held_out_articles": True,
     }
     with open(os.path.join(cfg.output_dir, f"d2_results_{cfg.geometry}.json"), "w") as f:
         json.dump(results, f, indent=2)

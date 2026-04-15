@@ -37,12 +37,18 @@ class TimeOrientation(nn.Module):
     """
 
     def __init__(self, dim: int, geometry: str = "lorentzian",
-                 hidden_dim: int = 64, n_layers: int = 2):
+                 hidden_dim: int = 64, n_layers: int = 2,
+                 mode: str = "auto"):
         super().__init__()
         self.dim = dim
         self.geometry = geometry
 
-        if geometry != "lorentzian":
+        if mode == "auto":
+            self.mode = "frame" if geometry == "lorentzian" else "mlp"
+        else:
+            self.mode = mode
+
+        if self.mode == "mlp":
             # Fallback MLP for non-Lorentzian geometries.
             # Has NO geometric anchor — must learn directionality
             # purely from data, which is harder and noisier.
@@ -103,7 +109,7 @@ class TimeOrientation(nn.Module):
         Returns:
             d_tau: (batch,) time increments
         """
-        if self.geometry == "lorentzian":
+        if self.mode == "frame":
             delta_s = s_next - s
             return self._get_time_component(metric, s, delta_s)
         else:
@@ -115,12 +121,10 @@ class TimeOrientation(nn.Module):
         """
         Compute τ(s) — narrative time at state s.
 
-        For Lorentzian: τ(s) = (A_met(s) · s)_0
-        (absolute time = projection of state onto local time axis)
-
-        For others: τ(s) = MLP(s)
+        For frame mode: τ(s) = (A_met(s) · s)_0
+        For MLP mode: τ(s) = MLP(s)
         """
-        if self.geometry == "lorentzian":
+        if self.mode == "frame":
             return self._get_time_component(metric, s, s)
         else:
             return self.fallback_mlp(s).squeeze(-1)

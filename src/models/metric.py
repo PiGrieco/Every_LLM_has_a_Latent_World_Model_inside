@@ -22,6 +22,7 @@ Key outputs:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class MetricNetwork(nn.Module):
@@ -112,7 +113,23 @@ class MetricNetwork(nn.Module):
         # This means the initial metric ≈ η (flat Minkowski or Euclidean)
         A_met = A_met + torch.eye(self.dim, device=s.device).unsqueeze(0)
 
+        # Gauge fix: force A₀₀ > 0 so that the time direction has a
+        # consistent sign convention across the batch. This is analogous
+        # to choosing a time orientation on a Lorentzian manifold — not
+        # cheating, just picking a convention.
+        if self.geometry == "lorentzian":
+            A_met = A_met.clone()
+            A_met[:, 0, 0] = F.softplus(A_met[:, 0, 0]) + 1e-3
+
         return A_met
+
+    def get_vielbein(self, s: torch.Tensor) -> torch.Tensor:
+        """Return the vielbein A(s), shape (B, D, D).
+        Public alias for _get_a_met — use this from outside the class."""
+        if self.geometry == "euclidean":
+            batch = s.shape[0]
+            return torch.eye(self.dim, device=s.device).unsqueeze(0).expand(batch, -1, -1)
+        return self._get_a_met(s)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
         """

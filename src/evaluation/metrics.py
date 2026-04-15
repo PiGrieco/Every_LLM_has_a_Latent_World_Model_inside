@@ -115,6 +115,23 @@ def m2_time_reversal_gap(
         result_dict["delta_tau_forward"] = sum(fwd_dtau) / len(fwd_dtau)
         result_dict["delta_tau_reversed"] = sum(rev_dtau) / len(rev_dtau)
 
+    # --- M2 decomposition: geometry-only vs Δτ-only ---
+    # Geometry-only: Δσ² gap without τ contribution
+    fwd_intervals, rev_intervals = [], []
+    for fwd, rev in zip(forward_trajectories, reversed_trajectories):
+        si_fwd = metric.squared_interval(fwd[:-1], fwd[1:] - fwd[:-1]).mean().item()
+        si_rev = metric.squared_interval(rev[:-1], rev[1:] - rev[:-1]).mean().item()
+        fwd_intervals.append(si_fwd)
+        rev_intervals.append(si_rev)
+    mean_si_fwd = sum(fwd_intervals) / len(fwd_intervals)
+    mean_si_rev = sum(rev_intervals) / len(rev_intervals)
+    result_dict["geo_only_gap"] = mean_si_rev - mean_si_fwd
+
+    if time_fn is not None:
+        result_dict["future_only_gap"] = (
+            result_dict["delta_tau_forward"] - result_dict["delta_tau_reversed"]
+        )
+
     return result_dict
 
 
