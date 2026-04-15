@@ -299,6 +299,76 @@ def m4_cone_alignment(
     return {"jaccard": jaccard, "precision": precision, "recall": recall}
 
 
+def m4_fair(
+    metric,
+    s: torch.Tensor,
+    s_next: torch.Tensor,
+    s_neg: torch.Tensor,
+    geometry: str,
+    base_rate: float = None,
+) -> dict:
+    """
+    Geometry-agnostic M4: does the model's notion of "reachable from s"
+    align with actual next states (vs random negatives)?
+
+    For Lorentzian: reachable = Δσ² ≤ 0 (inside light cone)
+    For Riemannian/Euclidean: reachable = distance² ≤ threshold,
+        calibrated so reachable_rate matches base_rate (from Lorentzian)
+
+    This makes the comparison fair: all geometries classify the same
+    fraction of pairs as reachable, so differences in M4 reflect
+    directional structure (cone vs ball), not threshold tuning.
+
+    Args:
+        metric: MetricNetwork
+        s: (N, D) current states
+        s_next: (N, D) true next states
+        s_neg: (N, D) random negative states (shuffled next states)
+        geometry: "lorentzian" | "riemannian" | "euclidean"
+        base_rate: fraction of pairs to classify as reachable.
+            If None and geometry is lorentzian, computed from data.
+            If None and geometry is not lorentzian, uses 0.5.
+
+    Returns:
+        dict with m4f_jaccard, m4f_precision, m4f_recall, m4f_base_rate
+    """
+    delta_real = s_next - s
+    delta_neg = s_neg - s
+    intervals_real = metric.squared_interval(s, delta_real)
+    intervals_neg = metric.squared_interval(s, delta_neg)
+
+    if geometry == "lorentzian":
+        reachable_real = intervals_real <= 0
+        reachable_neg = intervals_neg <= 0
+        if base_rate is None:
+            all_intervals = torch.cat([intervals_real, intervals_neg])
+            base_rate = (all_intervals <= 0).float().mean().item()
+    else:
+        all_intervals = torch.cat([intervals_real, intervals_neg])
+        if base_rate is None:
+            base_rate = 0.5
+        threshold = torch.quantile(all_intervals.float(), base_rate)
+        reachable_real = intervals_real <= threshold
+        reachable_neg = intervals_neg <= threshold
+
+    # "LM-plausible" = true next states; "not plausible" = random negatives
+    # Among reachable pairs: what fraction are real?
+    tp = reachable_real.float().sum()
+    fp = reachable_neg.float().sum()
+    fn = (~reachable_real).float().sum()
+
+    precision = (tp / (tp + fp).clamp(min=1)).item()
+    recall = (tp / (tp + fn).clamp(min=1)).item()
+    jaccard = (tp / (tp + fp + fn).clamp(min=1)).item()
+
+    return {
+        "m4f_jaccard": jaccard,
+        "m4f_precision": precision,
+        "m4f_recall": recall,
+        "m4f_base_rate": base_rate,
+    }
+
+
 def m5_predictive_nll(
     world_model,
     s: torch.Tensor,

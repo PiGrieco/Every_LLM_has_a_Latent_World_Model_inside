@@ -27,6 +27,49 @@ from ..training.candidates import build_candidate_set_c1, build_candidate_set_c2
 from ..evaluation.metrics import compute_all_metrics
 
 
+def verify_tau_coupling(time_fn, metric, geometry, latent_dim):
+    """Verify that τ is genuinely metric-coupled for Lorentzian
+    and genuinely independent (MLP) for baselines."""
+    device = next(metric.parameters()).device
+
+    n_params = sum(p.numel() for p in time_fn.parameters())
+    if time_fn.mode == "frame":
+        assert n_params == 0, (
+            f"τ in frame mode should have 0 params, but has {n_params}"
+        )
+    else:
+        assert n_params > 0, (
+            f"τ in MLP mode should have params, but has {n_params}"
+        )
+
+    if time_fn.mode == "frame" and geometry != "euclidean":
+        s = torch.randn(4, latent_dim, device=device)
+        s_next = torch.randn(4, latent_dim, device=device)
+
+        metric.zero_grad()
+        dt = time_fn.delta_tau(metric, s, s_next)
+        dt.sum().backward()
+
+        has_grad = any(
+            p.grad is not None and p.grad.abs().sum() > 0
+            for p in metric.parameters()
+        )
+        assert has_grad, (
+            "Δτ.backward() produced zero metric gradients — τ is NOT coupled"
+        )
+        metric.zero_grad()
+
+        with torch.no_grad():
+            dt1 = time_fn.delta_tau(metric, s, s_next)
+            s2 = s + 0.1 * torch.randn_like(s)
+            dt2 = time_fn.delta_tau(metric, s2, s_next)
+        assert not torch.allclose(dt1, dt2, atol=1e-6), (
+            "Δτ didn't change when inputs changed — collapsed to constant"
+        )
+
+    print(f"  [TAU CHECK] mode={time_fn.mode} | params={n_params} | {geometry} ✓")
+
+
 class WorldModelTrainer:
     """
     Orchestrates staged training of the full pipeline:
@@ -89,6 +132,9 @@ class WorldModelTrainer:
             mode=getattr(cfg, 'time_orientation_mode', 'auto'),
         ).to(self.device)
         self.lagrangian.set_time_orientation(self.time_fn, cfg.lambda_future)
+
+        if getattr(cfg, 'verify_tau', True):
+            verify_tau_coupling(self.time_fn, self.metric, cfg.geometry, cfg.latent_dim)
 
         # ---- Optimizer ----
         # Deduplicate: lagrangian contains metric as a submodule, so

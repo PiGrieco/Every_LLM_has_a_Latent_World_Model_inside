@@ -119,6 +119,7 @@ class Config:
     # ---- Geometry baselines ----
     geometry: Literal["lorentzian", "riemannian", "euclidean"] = "lorentzian"
     time_orientation_mode: str = "auto"  # "auto" | "frame" | "mlp"
+    verify_tau: bool = True              # Run τ coupling checks at init
 
     # ---- Paths ----
     cache_dir: str = "./cache"
