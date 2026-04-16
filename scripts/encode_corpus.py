@@ -6,6 +6,10 @@ This script precomputes everything that doesn't depend on learnable
 parameters, so the GPU-intensive encoding and LM scoring happen
 once and are cached to disk.
 
+Preprocessing (centering, PC removal, normalization) is intentionally
+done at train time so its statistics can be fit on train-only articles
+(avoiding leakage into the top principal components).
+
 Usage:
     python -m scripts.encode_corpus --config configs/d2_wikitext.yaml
 
@@ -19,7 +23,8 @@ Usage:
 Output:
     ./cache/wikitext_embeddings.pt   — per-article paragraph embeddings
     ./cache/wikitext_lm_scores.pt    — per-transition LM log-probs
-    ./cache/wikitext_preprocessed.pt — after centering + PC removal
+    ./cache/wikitext_split.pt        — article-level train/eval split
+    ./cache/wikitext_metadata.pt     — per-article metadata
 """
 
 import argparse
@@ -35,7 +40,6 @@ from src.data.wikitext import (
     encode_articles,
     compute_lm_log_probs,
 )
-from src.data.preprocessing import preprocess_trajectory_dataset
 
 
 def main():
@@ -68,7 +72,7 @@ def main():
         effective_max_articles = getattr(cfg, "max_articles", None)
 
     # ---- Step 1: Load articles ----
-    print("Step 1/4: Loading WikiText-103 articles...")
+    print("Step 1/3: Loading WikiText-103 articles...")
     if effective_max_articles is None:
         print("  [WARN] max_articles not set — loading the FULL WikiText-103 "
               "train split. LM scoring will take several HOURS on T4.")
@@ -93,7 +97,7 @@ def main():
     print(f"  → Article split: {n_train} train / {n_articles - n_train} eval")
 
     # ---- Step 2: Encode paragraphs ----
-    print("\nStep 2/4: Encoding paragraphs with sentence-transformer...")
+    print("\nStep 2/3: Encoding paragraphs with sentence-transformer...")
     embeddings = encode_articles(
         articles,
         encoder_name=cfg.encoder_name,
@@ -105,23 +109,12 @@ def main():
     total_paragraphs = sum(len(e) for e in embeddings)
     print(f"  → {total_paragraphs} paragraph embeddings ({embeddings[0].shape[1]}D)")
 
-    # ---- Step 3: Preprocess (center, remove top PCs, normalize) ----
-    print("\nStep 3/4: Preprocessing embeddings...")
-    processed, preprocessor = preprocess_trajectory_dataset(
-        embeddings,
-        n_pca_remove=cfg.n_pca_remove,
-        normalize=cfg.normalize_embeddings,
-    )
-    torch.save(
-        {"embeddings": processed, "preprocessor_mean": preprocessor.mean,
-         "preprocessor_components": preprocessor.top_components},
-        os.path.join(cfg.cache_dir, "wikitext_preprocessed.pt"),
-    )
-    print(f"  → Removed top {cfg.n_pca_remove} PCs, normalized")
+    # Preprocessing (PC removal + normalize) is done at train time so it can
+    # be fit on train-only articles; we intentionally do NOT cache it here.
 
-    # ---- Step 4: LM log-probabilities ----
+    # ---- Step 3: LM log-probabilities ----
     if not args.skip_lm:
-        print(f"\nStep 4/4: Computing LM log-probs with {cfg.lm_name}...")
+        print(f"\nStep 3/3: Computing LM log-probs with {cfg.lm_name}...")
         print("  (This is the slow step — grab a coffee)")
         log_probs = compute_lm_log_probs(
             articles,
@@ -134,7 +127,7 @@ def main():
         total_transitions = sum(len(lp) for lp in log_probs)
         print(f"  → {total_transitions} transition scores computed")
     else:
-        print("\nStep 4/4: Skipped LM scoring (corpus-only mode)")
+        print("\nStep 3/3: Skipped LM scoring (corpus-only mode)")
 
     # ---- Summary ----
     print("\n" + "=" * 50)
