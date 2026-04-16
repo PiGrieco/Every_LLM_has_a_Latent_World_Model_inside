@@ -30,7 +30,9 @@ from ..evaluation.metrics import compute_all_metrics
 def verify_tau_coupling(time_fn, metric, geometry, latent_dim):
     """Verify that τ is genuinely metric-coupled for Lorentzian
     and genuinely independent (MLP) for baselines."""
-    device = next(metric.parameters()).device
+    # Euclidean metric has no parameters — skip gradient checks
+    metric_params = list(metric.parameters())
+    device = metric_params[0].device if metric_params else torch.device("cpu")
 
     n_params = sum(p.numel() for p in time_fn.parameters())
     if time_fn.mode == "frame":
@@ -42,7 +44,7 @@ def verify_tau_coupling(time_fn, metric, geometry, latent_dim):
             f"τ in MLP mode should have params, but has {n_params}"
         )
 
-    if time_fn.mode == "frame" and geometry != "euclidean":
+    if time_fn.mode == "frame" and geometry not in ("euclidean",) and metric_params:
         s = torch.randn(4, latent_dim, device=device)
         s_next = torch.randn(4, latent_dim, device=device)
 
@@ -473,15 +475,6 @@ class WorldModelTrainer:
 
         s = self._to_latent(states)
         s_next = self._to_latent(next_states)
-
-        if not isinstance(self.adapter, IdentityAdapter):
-            s_chunks, sn_chunks = [], []
-            chunk_size = 4096
-            for i in range(0, len(s), chunk_size):
-                s_chunks.append(self.adapter(s[i:i+chunk_size]))
-                sn_chunks.append(self.adapter(s_next[i:i+chunk_size]))
-            s = torch.cat(s_chunks, dim=0)
-            s_next = torch.cat(sn_chunks, dim=0)
 
         return compute_all_metrics(
             metric=self.metric,
