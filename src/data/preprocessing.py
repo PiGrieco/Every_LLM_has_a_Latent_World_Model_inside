@@ -93,29 +93,37 @@ def preprocess_trajectory_dataset(
     preprocessor: Optional[EmbeddingPreprocessor] = None,
     n_pca_remove: int = 3,
     normalize: bool = True,
+    fit_indices: Optional[list] = None,
 ) -> Tuple[list, EmbeddingPreprocessor]:
     """
     Preprocess a list of per-trajectory embedding tensors.
 
-    If preprocessor is None, fits a new one on the concatenated embeddings.
+    If preprocessor is None, fits a new one. To avoid leaking statistics
+    from eval articles into the principal components, pass `fit_indices`
+    with the train-split article indices — fitting will only see those.
 
     Args:
         embeddings_list: list of (T_i, D) tensors
         preprocessor: optional pre-fitted preprocessor (for val/test)
+        fit_indices: optional list of indices into embeddings_list to use
+            for fitting (e.g. train articles only). Defaults to all.
 
     Returns:
         processed_list: list of (T_i, D) preprocessed tensors
         preprocessor: the fitted preprocessor
     """
-    # Concatenate all embeddings for fitting
     if preprocessor is None:
-        all_emb = torch.cat(embeddings_list, dim=0)
+        fit_src = (
+            [embeddings_list[i] for i in fit_indices]
+            if fit_indices is not None
+            else embeddings_list
+        )
+        all_emb = torch.cat(fit_src, dim=0)
         preprocessor = EmbeddingPreprocessor(
             n_pca_remove=n_pca_remove, normalize=normalize
         )
         preprocessor.fit(all_emb)
 
-    # Transform each trajectory
     processed = [preprocessor.transform(emb) for emb in embeddings_list]
 
     return processed, preprocessor

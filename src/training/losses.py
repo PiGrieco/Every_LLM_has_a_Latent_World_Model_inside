@@ -293,11 +293,11 @@ def compute_total_loss(
         # ML as calibration regularizer (small weight, prevents M5 blowup)
         losses["ml"] = maximum_likelihood_loss(world_model, s, s_next)
 
-        # Surrogate regression: anchor surrogate to LM scores (D2 only)
+        # Surrogate regression: anchor surrogate to LM scores (D2 only).
+        # Caller passes precomputed_lsem=None when scores are just dummy zeros.
         if (
             getattr(lagrangian, 'use_semantic_surrogate', False)
             and precomputed_lsem is not None
-            and precomputed_lsem.abs().sum() > 0
         ):
             losses["sem_reg"] = surrogate_regression_loss(
                 lagrangian, s, s_next, precomputed_lsem,

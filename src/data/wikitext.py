@@ -70,7 +70,9 @@ def load_wikitext_articles(
     """
     from datasets import load_dataset
 
-    use_streaming = max_articles is not None and max_articles < 5000
+    # Stream whenever we're loading a subset: avoids downloading the full
+    # ~500MB parquet. Full corpus → non-streaming (we need all of it anyway).
+    use_streaming = max_articles is not None
     ds = load_dataset(
         "wikitext", "wikitext-103-raw-v1",
         split=split,

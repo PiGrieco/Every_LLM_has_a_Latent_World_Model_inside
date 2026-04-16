@@ -51,6 +51,7 @@ class Lagrangian(nn.Module):
         self.temperature = 1.0
         self.time_fn = None
         self.lambda_future = 0.0
+        self.future_margin = 0.1   # Overridden via set_time_orientation
 
         # Optional: learned surrogate for semantic cost
         # Useful when LM queries are expensive or in corpus-only setting
@@ -134,7 +135,7 @@ class Lagrangian(nn.Module):
         # or fallback MLP (baselines). Makes action asymmetric.
         if self.time_fn is not None:
             d_tau = self.time_fn.delta_tau(self.metric, s, s_next)
-            L_future = F.softplus(0.1 - d_tau)
+            L_future = F.softplus(self.future_margin - d_tau)
             total = total + self.lambda_future * L_future
 
         return total
@@ -163,7 +164,9 @@ class Lagrangian(nn.Module):
         """Set Gibbs temperature for candidate-set matching."""
         self.temperature = max(T, 0.1)
 
-    def set_time_orientation(self, time_fn, lambda_future: float = 0.5):
+    def set_time_orientation(self, time_fn, lambda_future: float = 0.5,
+                             future_margin: float = 0.1):
         """Attach a time orientation function to the Lagrangian."""
         self.time_fn = time_fn
         self.lambda_future = lambda_future
+        self.future_margin = future_margin

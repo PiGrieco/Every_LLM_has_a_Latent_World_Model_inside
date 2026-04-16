@@ -14,6 +14,7 @@ seed: 42
 # WikiText params
 min_paragraphs: 5
 max_paragraphs: 80
+max_articles: 5000        # Cap per Colab: ~10-15 min encoding. Rimuovi (o metti null) per corpus completo (ore).
 wikitext_split: train
 
 # Encoder

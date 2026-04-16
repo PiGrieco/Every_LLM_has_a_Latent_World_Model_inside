@@ -44,7 +44,8 @@ def main():
     parser.add_argument("--encoder", type=str, default="sentence-transformers/all-MiniLM-L6-v2")
     parser.add_argument("--lm", type=str, default="gpt2-medium")
     parser.add_argument("--max_articles", type=int, default=None,
-                        help="Limit number of articles (None = all)")
+                        help="Limit number of articles (None = use config value, "
+                             "or full corpus if config has none)")
     parser.add_argument("--cache_dir", type=str, default="./cache")
     parser.add_argument("--skip_lm", action="store_true",
                         help="Skip LM log-prob computation (corpus-only mode)")
@@ -61,13 +62,21 @@ def main():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     os.makedirs(cfg.cache_dir, exist_ok=True)
 
+    # CLI flag has priority over config; otherwise fall back to config field.
+    effective_max_articles = args.max_articles
+    if effective_max_articles is None:
+        effective_max_articles = getattr(cfg, "max_articles", None)
+
     # ---- Step 1: Load articles ----
     print("Step 1/4: Loading WikiText-103 articles...")
+    if effective_max_articles is None:
+        print("  [WARN] max_articles not set — loading the FULL WikiText-103 "
+              "train split. LM scoring will take several HOURS on T4.")
     articles = load_wikitext_articles(
         split=cfg.wikitext_split,
         min_paragraphs=cfg.min_paragraphs,
         max_paragraphs=cfg.max_paragraphs,
-        max_articles=args.max_articles,
+        max_articles=effective_max_articles,
     )
     print(f"  → {len(articles)} articles loaded")
 

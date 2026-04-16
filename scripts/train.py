@@ -375,14 +375,6 @@ def run_d2(cfg):
         print("No LM scores and lambda_sem=0 — running without semantic term")
         lm_scores = None
 
-    # Preprocess
-    print("Preprocessing embeddings...")
-    processed, _ = preprocess_trajectory_dataset(
-        embeddings,
-        n_pca_remove=cfg.n_pca_remove,
-        normalize=cfg.normalize_embeddings,
-    )
-
     # Article-level split for non-circular evaluation:
     # M4 is computed on articles never seen during training.
     split_path = cache_dir / "wikitext_split.pt"
@@ -392,12 +384,22 @@ def run_d2(cfg):
         eval_arts = set(split_data["eval_indices"])
         print(f"  Using article-level split: {len(train_arts)} train / {len(eval_arts)} eval articles")
     else:
-        n_art = len(processed)
+        n_art = len(embeddings)
         perm_art = torch.randperm(n_art).tolist()
         n_train_art = int(0.8 * n_art)
         train_arts = set(perm_art[:n_train_art])
         eval_arts = set(perm_art[n_train_art:])
         print(f"  No split file — created random split: {len(train_arts)}/{len(eval_arts)}")
+
+    # Preprocess AFTER split so the top PCs are fit only on train articles
+    # (otherwise eval statistics leak into the centering / PC removal step).
+    print("Preprocessing embeddings (fit on train articles only)...")
+    processed, _ = preprocess_trajectory_dataset(
+        embeddings,
+        n_pca_remove=cfg.n_pca_remove,
+        normalize=cfg.normalize_embeddings,
+        fit_indices=sorted(train_arts),
+    )
 
     def _extract_transitions(indices):
         ss, sn, ls = [], [], []

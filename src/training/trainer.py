@@ -133,7 +133,9 @@ class WorldModelTrainer:
             n_layers=2,
             mode=getattr(cfg, 'time_orientation_mode', 'auto'),
         ).to(self.device)
-        self.lagrangian.set_time_orientation(self.time_fn, cfg.lambda_future)
+        self.lagrangian.set_time_orientation(
+            self.time_fn, cfg.lambda_future, future_margin=cfg.future_margin,
+        )
 
         if getattr(cfg, 'verify_tau', True):
             verify_tau_coupling(self.time_fn, self.metric, cfg.geometry, cfg.latent_dim)
@@ -163,6 +165,7 @@ class WorldModelTrainer:
         self.all_states_cache = None
         self.raw_states_cache = None
         self._dynamic_weights = None
+        self.has_real_lsem = False
         self.history = {"epoch": [], "stage": []}
 
     @torch.no_grad()
@@ -181,12 +184,23 @@ class WorldModelTrainer:
         return result
 
     def _prepare_data(self, states, next_states, lsem=None):
-        """Create a DataLoader from transition tensors."""
+        """Create a DataLoader from transition tensors.
+
+        We always pass a third tensor through the loader so unpacking
+        stays uniform. `self.has_real_lsem` records whether that tensor
+        contains true LM scores (to be used) or dummy zeros (to be
+        ignored) — safer than heuristically testing abs().sum() > 0.
+        """
+        self.has_real_lsem = lsem is not None
         tensors = [states, next_states]
-        if lsem is not None:
-            tensors.append(lsem)
-        else:
-            tensors.append(torch.zeros(len(states)))
+        tensors.append(lsem if lsem is not None else torch.zeros(len(states)))
+
+        if len(states) < self.cfg.batch_size:
+            raise RuntimeError(
+                f"Dataset has only {len(states)} transitions but batch_size is "
+                f"{self.cfg.batch_size} and drop_last=True, so no training step "
+                f"would run. Lower batch_size or generate more data."
+            )
 
         dataset = TensorDataset(*[t.to(self.device) for t in tensors])
         return DataLoader(
@@ -269,6 +283,7 @@ class WorldModelTrainer:
 
         epoch_losses = {}
         n_batches = 0
+        tl_frac_sum = 0.0
 
         for batch in loader:
             s_raw, s_next_raw, lsem = batch
@@ -288,7 +303,7 @@ class WorldModelTrainer:
                 s=s,
                 s_next=s_next,
                 candidates=candidates,
-                precomputed_lsem=lsem if lsem.abs().sum() > 0 else None,
+                precomputed_lsem=lsem if self.has_real_lsem else None,
                 cfg=self.cfg,
                 stage=stage,
                 current_epoch=self.current_epoch,
@@ -312,20 +327,21 @@ class WorldModelTrainer:
                     torch.nn.utils.clip_grad_norm_(clip_params, self.cfg.grad_clip)
                 self.optimizer.step()
 
-            # Track time-like fraction for diagnostics
+            # Track time-like fraction for diagnostics (averaged across batches)
             with torch.no_grad():
                 diag_intervals = self.metric.squared_interval(s, s_next - s)
-                batch_tl_frac = (diag_intervals < 0).float().mean().item()
+                tl_frac_sum += (diag_intervals < 0).float().mean().item()
 
             # Accumulate losses
             for k, v in losses.items():
                 epoch_losses[k] = epoch_losses.get(k, 0.0) + v.item()
             n_batches += 1
 
-        epoch_losses["timelike_frac"] = batch_tl_frac
+        # Average losses; timelike_frac is averaged the same way
+        denom = max(n_batches, 1)
+        epoch_losses["timelike_frac"] = tl_frac_sum / denom
 
-        # Average
-        return {k: (v / max(n_batches, 1) if k != "timelike_frac" else v) for k, v in epoch_losses.items()}
+        return {k: (v / denom if k != "timelike_frac" else v) for k, v in epoch_losses.items()}
 
     def train(
         self,

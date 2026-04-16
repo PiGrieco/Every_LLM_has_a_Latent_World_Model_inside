@@ -31,6 +31,7 @@ class Config:
     # D2 params
     min_paragraphs: int = 5
     max_paragraphs: int = 100
+    max_articles: Optional[int] = None   # Cap WikiText-103 articles; None = full corpus (hours on T4)
     wikitext_split: str = "train"
 
     # ---- Encoder (D2 only) ----
