@@ -536,6 +536,69 @@ def run_d2(cfg):
     }
     # M5 discrete (candidate-set ranking) — thesis metric
     results.update({f"m5disc_{k}": v for k, v in m5d.items()})
+
+    # --- Coherence probe (extrinsic test) ---
+    # Linear probe on [s_t ; s_{t+1}] pairs. Compares the geometrically
+    # projected latent against the raw preprocessed encoder embeddings to
+    # quantify how much discourse-coherence signal survives the projection.
+    # Built and trained on HELD-OUT articles only, to keep it extrinsic.
+    print("\n--- Coherence probe (extrinsic test) ---")
+    from src.evaluation.probe import build_coherence_pairs, train_probe
+
+    eval_art_indices = [i for i in sorted(eval_arts) if i < len(processed)]
+
+    if len(eval_art_indices) < 2:
+        print("  [WARN] Fewer than 2 held-out articles; skipping coherence probe.")
+        probe_lat = probe_raw = None
+    else:
+        # Latent trajectories (384D → latent_dim via adapter).
+        # Run on CPU for the probe: pairs are small and this keeps the probe
+        # device-agnostic.
+        processed_lat = [
+            trainer._to_latent(processed[i]).cpu() for i in eval_art_indices
+        ]
+        # Raw preprocessed trajectories (384D, no adapter).
+        processed_raw = [processed[i].cpu() for i in eval_art_indices]
+
+        # Cap the number of held-out paragraph transitions that end up in the
+        # probe: 5000 positives + 5000 negatives is usually plenty.
+        inputs_lat, labels_lat = build_coherence_pairs(
+            processed_lat, n_positive=5000, n_negative=5000, seed=cfg.seed,
+        )
+        probe_lat = train_probe(inputs_lat, labels_lat, seed=cfg.seed)
+        print(
+            f"  Probe on latent ({cfg.geometry:<10}): "
+            f"val_acc={probe_lat['val_acc']:.4f}  "
+            f"AUROC={probe_lat['val_auroc']:.4f}  "
+            f"(train_acc={probe_lat['train_acc']:.4f}, "
+            f"epochs={probe_lat['epochs_run']}, dim={inputs_lat.shape[1]})"
+        )
+
+        inputs_raw, labels_raw = build_coherence_pairs(
+            processed_raw, n_positive=5000, n_negative=5000, seed=cfg.seed,
+        )
+        probe_raw = train_probe(inputs_raw, labels_raw, seed=cfg.seed)
+        print(
+            f"  Probe on raw embeddings   : "
+            f"val_acc={probe_raw['val_acc']:.4f}  "
+            f"AUROC={probe_raw['val_auroc']:.4f}  "
+            f"(train_acc={probe_raw['train_acc']:.4f}, "
+            f"epochs={probe_raw['epochs_run']}, dim={inputs_raw.shape[1]})"
+        )
+
+        gap = probe_raw["val_acc"] - probe_lat["val_acc"]
+        if gap > 0.05:
+            print(f"  [NOTE] Geometric projection lost {gap*100:.1f} pp of "
+                  f"coherence accuracy vs raw encoder.")
+
+    if probe_lat is not None:
+        results["probe_latent_acc"] = probe_lat["val_acc"]
+        results["probe_latent_auroc"] = probe_lat["val_auroc"]
+        results["probe_latent_train_acc"] = probe_lat["train_acc"]
+        results["probe_raw_acc"] = probe_raw["val_acc"]
+        results["probe_raw_auroc"] = probe_raw["val_auroc"]
+        results["probe_raw_train_acc"] = probe_raw["train_acc"]
+
     with open(os.path.join(cfg.output_dir, f"d2_results_{cfg.geometry}.json"), "w") as f:
         json.dump(results, f, indent=2)
 
