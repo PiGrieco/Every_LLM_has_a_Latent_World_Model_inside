@@ -207,50 +207,38 @@ def test_variance_diagnostic_detects_collapse():
 # compute_all_metrics integration
 # --------------------------------------------------------------------------
 
-def test_compute_all_metrics_exposes_new_keys():
-    """compute_all_metrics must surface m5d_*, m4fair_*, m4raw_*, wm_*."""
+def test_compute_all_metrics_is_lightweight():
+    """compute_all_metrics is the training-time eval bundle: it must
+    surface cheap diagnostics (M1, M5 NLL, variance diagnostic, M4 raw)
+    but NOT the heavy final-eval metrics (m4f_*, m5d_*, probe_*). The
+    heavy ones belong to run_d2's end-of-training block, where we can
+    properly couple base_rate across geometries."""
     D, B = 8, 64
     metric, lag, wm = _mk_stack(dim=D)
     s, s_next = _mk_data(dim=D, n=B)
     r = compute_all_metrics(metric, wm, lag, s, s_next)
 
+    # Must contain: lightweight keys
     for k in (
         "m1_timelike_rate", "m5_nll",
         "wm_mean_logvar", "wm_frac_at_floor", "wm_logvar_floor", "wm_collapsed",
         "m4raw_jaccard", "m4raw_precision", "m4raw_recall",
-        "m4fair_jaccard", "m4fair_precision", "m4fair_recall", "m4fair_base_rate",
-        "m5d_ce", "m5d_top1", "m5d_topk", "m5d_mrr", "m5d_topk_k",
     ):
-        assert k in r, f"missing key {k}"
+        assert k in r, f"missing lightweight key {k}"
 
-    # Legacy keys from the m5_discrete_rank era must NOT leak.
-    for legacy in ("m5disc_q_top1_acc", "m5disc_K_top1_acc"):
-        assert legacy not in r, f"legacy key {legacy} leaked"
-    print("  [OK] compute_all_metrics exposes m4fair_*, m4raw_*, m5d_*, wm_* keys")
-
-
-def test_compute_all_metrics_accepts_semantic_costs():
-    """Passing semantic_costs must not error; must affect m4fair_* values."""
-    D, B = 8, 64
-    metric, lag, wm = _mk_stack(dim=D)
-    s, s_next = _mk_data(dim=D, n=B)
-    # Identical to the compute_all_metrics candidate builder (hardcoded C=32).
-    C = 32
-    n_ev = min(256, B)
-    torch.manual_seed(0)
-    sem = torch.randn(n_ev, C).abs()
-    r_with = compute_all_metrics(metric, wm, lag, s, s_next, semantic_costs=sem)
-    r_without = compute_all_metrics(metric, wm, lag, s, s_next, semantic_costs=None)
-
-    assert "m4fair_jaccard" in r_with and "m4fair_jaccard" in r_without
-    # They should generally differ (different plausibility sets). Allow the
-    # rare coincidence where both land on the same value.
-    if r_with["m4fair_jaccard"] == r_without["m4fair_jaccard"]:
-        print("  [NOTE] semantic_costs did not change m4fair_jaccard "
-              "in this seed — acceptable but unusual")
-    print(f"  [OK] semantic_costs accepted: "
-          f"m4fair_jaccard with={r_with['m4fair_jaccard']:.4f}, "
-          f"without={r_without['m4fair_jaccard']:.4f}")
+    # Must NOT contain: heavy final-eval keys. Those live in run_d2.
+    for heavy in (
+        "m4fair_jaccard", "m4fair_precision", "m4fair_recall", "m4fair_base_rate",
+        "m4f_jaccard", "m4f_precision", "m4f_recall", "m4f_base_rate",
+        "m5d_ce", "m5d_top1", "m5d_topk", "m5d_mrr", "m5d_topk_k",
+        "probe_latent_acc", "probe_raw_acc",
+    ):
+        assert heavy not in r, (
+            f"heavy key {heavy} leaked into the training-time eval bundle; "
+            f"move it to run_d2's final eval"
+        )
+    print("  [OK] compute_all_metrics lightweight bundle: "
+          "m1/m5_nll/wm_*/m4raw_* only, no m4f_*/m5d_*/probe_*")
 
 
 def main():
@@ -261,8 +249,7 @@ def main():
     test_m5_candidate_metrics_perfect_model()
     test_variance_diagnostic_not_collapsed()
     test_variance_diagnostic_detects_collapse()
-    test_compute_all_metrics_exposes_new_keys()
-    test_compute_all_metrics_accepts_semantic_costs()
+    test_compute_all_metrics_is_lightweight()
     print("\nAll tests passed.")
 
 

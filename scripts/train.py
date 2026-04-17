@@ -395,11 +395,42 @@ def run_d2(cfg):
         print(f"  Using article-level split: {len(train_arts)} train / {len(eval_arts)} eval articles")
     else:
         n_art = len(embeddings)
-        perm_art = torch.randperm(n_art).tolist()
+        # Deterministic split keyed on cfg.seed so re-runs without the file
+        # reproduce the same partition; persist it so subsequent geometries
+        # and downstream analyses use the same articles.
+        g = torch.Generator().manual_seed(cfg.seed)
+        perm_art = torch.randperm(n_art, generator=g).tolist()
         n_train_art = int(0.8 * n_art)
         train_arts = set(perm_art[:n_train_art])
         eval_arts = set(perm_art[n_train_art:])
-        print(f"  No split file — created random split: {len(train_arts)}/{len(eval_arts)}")
+        torch.save(
+            {"train_indices": sorted(train_arts),
+             "eval_indices": sorted(eval_arts)},
+            split_path,
+        )
+        print(f"  Created and SAVED split to {split_path}: "
+              f"{len(train_arts)} train / {len(eval_arts)} eval articles")
+
+    # Split hash: guard against mid-run inconsistency. If a previous
+    # geometry persisted d2_base_rate.json with a different split, we'd
+    # silently compare across different eval sets — reject up front.
+    import hashlib
+    split_hash = hashlib.sha1(
+        f"{sorted(train_arts)}|{sorted(eval_arts)}".encode()
+    ).hexdigest()[:12]
+    print(f"  Split hash: {split_hash}")
+
+    base_rate_path = os.path.join(cfg.output_dir, "d2_base_rate.json")
+    if os.path.exists(base_rate_path):
+        with open(base_rate_path) as f:
+            _ref = json.load(f)
+        if "split_hash" in _ref and _ref["split_hash"] != split_hash:
+            raise RuntimeError(
+                f"Split hash mismatch! Previous run used split "
+                f"{_ref['split_hash']}, current is {split_hash}. "
+                f"Delete {base_rate_path} and re-run Lorentzian first, "
+                f"or restore the original wikitext_split.pt."
+            )
 
     # Preprocess AFTER split so the top PCs are fit only on train articles
     # (otherwise eval statistics leak into the centering / PC removal step).
@@ -496,10 +527,10 @@ def run_d2(cfg):
         )
 
         # --- M4 fair with shared base_rate coupling across geometries ---
+        # base_rate_path was built above (when we computed the split hash).
         base_rate = None
-        lorentz_ref_path = os.path.join(cfg.output_dir, "d2_base_rate.json")
-        if cfg.geometry != "lorentzian" and os.path.exists(lorentz_ref_path):
-            with open(lorentz_ref_path) as f:
+        if cfg.geometry != "lorentzian" and os.path.exists(base_rate_path):
+            with open(base_rate_path) as f:
                 base_rate = json.load(f).get("base_rate")
 
         m4_fair_r = m4_fair_candidates(
@@ -511,19 +542,23 @@ def run_d2(cfg):
             semantic_costs=semantic_costs,
         )
 
-        # Lorentzian persists its auto-calibrated base_rate for the
-        # baselines to reuse. Run order enforced in scripts/run_baselines.py.
+        # Lorentzian persists its auto-calibrated base_rate AND the split
+        # hash for the baselines to cross-check. Run order enforced in
+        # scripts/run_d2_baselines.py.
         os.makedirs(cfg.output_dir, exist_ok=True)
         if cfg.geometry == "lorentzian":
-            with open(lorentz_ref_path, "w") as f:
-                json.dump({"base_rate": m4_fair_r["m4f_base_rate"]}, f, indent=2)
+            with open(base_rate_path, "w") as f:
+                json.dump({
+                    "base_rate": m4_fair_r["m4f_base_rate"],
+                    "split_hash": split_hash,
+                }, f, indent=2)
             print(f"  [M4-fair] Lorentzian auto-calibrated base_rate="
-                  f"{m4_fair_r['m4f_base_rate']:.4f} → saved to {lorentz_ref_path}")
+                  f"{m4_fair_r['m4f_base_rate']:.4f} → saved to {base_rate_path}")
         elif base_rate is not None:
             print(f"  [M4-fair] Loaded Lorentzian base_rate="
                   f"{base_rate:.4f} for fair comparison")
         else:
-            print(f"  [M4-fair] [WARN] {lorentz_ref_path} not found — "
+            print(f"  [M4-fair] [WARN] {base_rate_path} not found — "
                   f"Lorentzian must run first for a fair comparison. "
                   f"Falling back to uncalibrated run (base_rate=0.5).")
 
@@ -533,14 +568,20 @@ def run_d2(cfg):
         )
 
     # ---- Variance-collapse print block ----
+    # "12/16 dims collapsed" reads much more sharply than "mean_logvar = -9.8"
+    # for a non-technical reviewer, so we compute and print the count.
+    floor = wm_diag["wm_logvar_floor"]
+    D_wm = trainer.world_model.dim
+    n_collapsed = int(round(wm_diag["wm_frac_at_floor"] * D_wm))
     print(f"\n[VARIANCE DIAGNOSTIC]")
-    print(f"  mean logvar = {wm_diag['wm_mean_logvar']:.3f} "
-          f"(floor = {wm_diag['wm_logvar_floor']})")
-    print(f"  fraction of dims at floor (within 0.1): "
-          f"{wm_diag['wm_frac_at_floor']:.3f}")
-    if wm_diag["wm_collapsed"]:
-        print(f"  ⚠️  WORLD MODEL VARIANCE COLLAPSED — M5 continuous NLL is "
-              f"not meaningful for this run. Use M5 discrete (m5d_*) instead.")
+    print(f"  mean logvar = {wm_diag['wm_mean_logvar']:.3f}  (clamp floor = {floor})")
+    print(f"  dims at floor (within 0.1): {n_collapsed}/{D_wm} "
+          f"({wm_diag['wm_frac_at_floor']*100:.1f}%)")
+    if wm_diag["wm_frac_at_floor"] > 0.5:
+        print(f"  ⚠️  MAJORITY OF DIMS COLLAPSED TO VARIANCE FLOOR")
+        print(f"      Continuous NLL (m5={m5:.3f}) is NOT a meaningful "
+              f"predictive metric for this run.")
+        print(f"      Report m5d_* (discrete candidate metrics) instead.")
 
     print(f"\n--- D2 Results ({cfg.geometry}) ---")
     print(f"M1 (time-likeness rate):              {m1:.4f}")
@@ -584,20 +625,28 @@ def run_d2(cfg):
     print("\n--- Coherence probe (extrinsic test) ---")
     from src.evaluation.probe import build_coherence_pairs, train_probe
 
-    eval_art_indices = [i for i in sorted(eval_arts) if i < len(processed)]
+    n_eval_arts = sum(1 for i in eval_arts if i < len(processed))
 
-    if len(eval_art_indices) < 2:
+    if n_eval_arts < 2:
         print("  [WARN] Fewer than 2 held-out articles; skipping coherence probe.")
         probe_lat = probe_raw = None
     else:
-        # Latent trajectories (384D → latent_dim via adapter).
+        # Latent trajectories (384D → latent_dim via adapter). Built with
+        # enumerate over `processed` to make the filter explicit.
         # Run on CPU for the probe: pairs are small and this keeps the probe
         # device-agnostic.
-        processed_lat = [
-            trainer._to_latent(processed[i]).cpu() for i in eval_art_indices
-        ]
+        with torch.no_grad():
+            processed_lat = [
+                trainer._to_latent(emb).cpu()
+                for i, emb in enumerate(processed)
+                if i in eval_arts
+            ]
         # Raw preprocessed trajectories (384D, no adapter).
-        processed_raw = [processed[i].cpu() for i in eval_art_indices]
+        processed_raw = [
+            processed[i].cpu()
+            for i in sorted(eval_arts)
+            if i < len(processed)
+        ]
 
         # Cap the number of held-out paragraph transitions that end up in the
         # probe: 5000 positives + 5000 negatives is usually plenty.

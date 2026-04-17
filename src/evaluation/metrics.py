@@ -668,46 +668,44 @@ def compute_all_metrics(
     forward_trajectories: Optional[list] = None,
     reversed_trajectories: Optional[list] = None,
     branch_data: Optional[dict] = None,
-    base_rate: Optional[float] = None,
-    semantic_costs: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """
-    Compute all applicable metrics given the available data.
+    Light-weight training-time eval bundle.
 
-    Args:
-        base_rate: shared "reachable" fraction for m4_fair_candidates across
-            geometries. Pass None for the reference geometry (typically
-            Lorentzian) to auto-calibrate from its candidate set; pass that
-            same value to the baselines for a fair comparison.
-        semantic_costs: optional (n_ev, C) per-candidate semantic costs from
-            the trained semantic surrogate. When provided, the plausibility
-            set in m4_fair_candidates is defined without the geometric term.
+    Invoked every ``cfg.eval_every`` epochs by ``WorldModelTrainer``, so
+    this function intentionally excludes the expensive, protocol-heavy
+    final-eval metrics (``m4_fair_candidates``, ``m5_candidate_metrics``,
+    coherence probe). Those live in ``run_d2`` and are computed once on
+    the held-out eval set at the end of training, where Lorentzian can
+    calibrate a shared ``base_rate`` cleanly for the baselines.
 
-    Returns a dict of metric_name -> value. Includes:
-      - m1_timelike_rate
-      - m5_nll              (continuous diagnostic; unreliable under clamp)
-      - wm_mean_logvar / wm_frac_at_floor / wm_logvar_floor / wm_collapsed
-        (variance-collapse diagnostic for m5_nll)
-      - m2_*   (only when forward/reversed trajectories are supplied)
-      - m4raw_*  (cone alignment — tautological for non-Lorentzian)
-      - m4fair_* (candidate-set fair M4, back-compat prefix)
-      - m5d_*  (discrete predictive metrics via world-model ranking)
-      - m3_*   (only when branch_data is supplied)
+    Included here:
+
+      - M1 (time-likeness rate)
+      - M5 continuous NLL (diagnostic; may be dominated by variance clamp)
+      - world_model_variance_diagnostic (cheap and useful to track the
+        collapse trajectory during training)
+      - M4 raw cone alignment (tautological on non-Lorentzian; a
+        consistency check at training time for the Lorentzian branch)
+      - M2_* when forward/reversed trajectories are supplied (D0/D1)
+      - M3 branching separation when branch data are supplied (D1)
+
+    NOT included (deliberately): m4_fair_*, m5d_*, probe_*. Compute those
+    at the end of training with the proper coupling protocol.
     """
     results = {}
 
     # M1: Time-likeness rate (always available)
     results["m1_timelike_rate"] = m1_timelike_rate(metric, s, s_next)
 
-    # M5 continuous (kept as a diagnostic; may be dominated by variance clamp)
+    # M5 continuous (diagnostic; unreliable under variance clamp)
     results["m5_nll"] = m5_predictive_nll(world_model, s, s_next)
 
-    # Variance-collapse diagnostic for M5 continuous.
-    # Without this, a collapsed Gaussian can report spuriously low NLL.
+    # Variance-collapse diagnostic — cheap; useful trajectory to plot
     n_diag = min(512, s.shape[0])
     results.update(world_model_variance_diagnostic(world_model, s[:n_diag]))
 
-    # M2: Time-reversal gap (needs forward + reversed trajectories)
+    # M2: Time-reversal gap (only when forward + reversed trajectories exist)
     if forward_trajectories and reversed_trajectories:
         m2 = m2_time_reversal_gap(
             metric, lagrangian, world_model,
@@ -715,39 +713,17 @@ def compute_all_metrics(
         )
         results.update({f"m2_{k}": v for k, v in m2.items()})
 
-    # M4 + M5-discrete (need a candidate set)
+    # M4 raw (diagnostic only — m4fair_* / m5d_* belong to the final eval)
     if s.shape[0] >= 16:
         from ..training.candidates import build_candidate_set_c1
         n_ev = min(256, s.shape[0])
-        cands_m4, true_idx = build_candidate_set_c1(
+        cands_m4, _ = build_candidate_set_c1(
             s[:n_ev], s_next[:n_ev], candidate_size=32
         )
-
-        # ---- M4 raw: diagnostic only (tautological for non-Lorentzian) ----
         m4 = m4_cone_alignment(metric, lagrangian, s[:n_ev], cands_m4)
         results.update({f"m4raw_{k}": v for k, v in m4.items()})
 
-        # ---- M4 fair on the candidate set (supersedes shuffled-neg m4_fair) ----
-        geometry = getattr(metric, "geometry", "lorentzian")
-        m4f = m4_fair_candidates(
-            metric, lagrangian,
-            s[:n_ev], cands_m4,
-            geometry=geometry,
-            base_rate=base_rate,
-            semantic_costs=semantic_costs,
-        )
-        # Back-compat: keep the m4fair_* output prefix.
-        results.update(
-            {f"m4fair_{k[len('m4f_'):]}": v for k, v in m4f.items()}
-        )
-
-        # ---- M5 discrete: clamp-invariant world-model ranking ----
-        m5d = m5_candidate_metrics(
-            world_model, s[:n_ev], cands_m4, true_idx, topk=5,
-        )
-        results.update(m5d)
-
-    # M3: Branching separation (needs branch data)
+    # M3: Branching separation (D1)
     if branch_data:
         rates = []
         for prefix_s, branches in branch_data:
