@@ -46,6 +46,11 @@ def main():
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name()} | batch_size={batch_size} | n_traj={n_traj}")
 
+    # Order matters for D2's M4-fair protocol: Lorentzian must run FIRST so
+    # it can self-calibrate base_rate and persist d2_base_rate.json; the
+    # other geometries load that value to make their M4 comparable. Keep
+    # lorentzian at index 0. (D0/D1 don't use base_rate coupling, so the
+    # order doesn't matter for them, but we keep it consistent.)
     geometries = ["lorentzian", "riemannian", "euclidean"]
 
     # ---- D0: Time-reversal across geometries ----

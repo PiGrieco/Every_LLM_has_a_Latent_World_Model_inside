@@ -427,11 +427,21 @@ def compute_all_metrics(
     forward_trajectories: Optional[list] = None,
     reversed_trajectories: Optional[list] = None,
     branch_data: Optional[dict] = None,
+    base_rate: Optional[float] = None,
 ) -> Dict[str, float]:
     """
     Compute all applicable metrics given the available data.
 
-    Returns a dict of metric_name -> value.
+    Args:
+        base_rate: shared "reachable" fraction for m4_fair across geometries.
+            Pass None for the reference geometry (typically Lorentzian) to
+            auto-calibrate from its intervals; pass that same value to the
+            baselines for a fair comparison. See m4_fair for details.
+
+    Returns a dict of metric_name -> value. M4 is reported twice:
+      - m4raw_*  : raw cone alignment (tautologically zero for
+                   Euclidean/Riemannian where squared_interval ≥ 0)
+      - m4fair_* : geometry-agnostic version with a shared base_rate
     """
     results = {}
 
@@ -452,9 +462,28 @@ def compute_all_metrics(
     # M4: Cone alignment (needs candidate sets)
     if s.shape[0] >= 16:
         from ..training.candidates import build_candidate_set_c1
-        cands_m4, _ = build_candidate_set_c1(s[:256], s_next[:256], candidate_size=32)
-        m4 = m4_cone_alignment(metric, lagrangian, s[:256], cands_m4)
-        results.update({f"m4_{k}": v for k, v in m4.items()})
+        n_ev = min(256, s.shape[0])
+        cands_m4, _ = build_candidate_set_c1(
+            s[:n_ev], s_next[:n_ev], candidate_size=32
+        )
+        # ---- M4 raw: diagnostic only (tautological for non-Lorentzian) ----
+        m4 = m4_cone_alignment(metric, lagrangian, s[:n_ev], cands_m4)
+        results.update({f"m4raw_{k}": v for k, v in m4.items()})
+
+        # ---- M4 fair: geometry-agnostic with shared base_rate ----
+        perm = torch.randperm(n_ev, device=s.device)
+        m4f = m4_fair(
+            metric,
+            s[:n_ev],
+            s_next[:n_ev],
+            s_next[:n_ev][perm],
+            geometry=metric.geometry,
+            base_rate=base_rate,
+        )
+        # Rename m4f_* -> m4fair_* as requested by the evaluation protocol
+        results.update(
+            {f"m4fair_{k[len('m4f_'):]}": v for k, v in m4f.items()}
+        )
 
     # M3: Branching separation (needs branch data)
     if branch_data:

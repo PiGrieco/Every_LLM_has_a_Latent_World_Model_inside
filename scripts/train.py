@@ -444,27 +444,77 @@ def run_d2(cfg):
         m1 = m1_timelike_rate(trainer.metric, es_lat, esn_lat)
         m5 = m5_predictive_nll(trainer.world_model, es_lat, esn_lat)
 
-        # M4 cone alignment on held-out articles
+        # ---- M4 raw cone alignment on held-out articles ----
+        # Tautological for Euclidean/Riemannian where squared_interval ≥ 0,
+        # but kept as a diagnostic for the Lorentzian case.
         from src.training.candidates import build_candidate_set_c1
-        from src.evaluation.metrics import m4_cone_alignment
+        from src.evaluation.metrics import m4_cone_alignment, m4_fair
         n_ev = min(256, len(es_lat))
         cands, _ = build_candidate_set_c1(es_lat[:n_ev], esn_lat[:n_ev], 32)
         m4 = m4_cone_alignment(trainer.metric, trainer.lagrangian,
                                es_lat[:n_ev], cands)
 
+        # ---- M4 fair with shared base_rate across geometries ----
+        # Protocol: Lorentzian runs first and self-calibrates its base_rate,
+        # which is persisted to disk; Riemannian/Euclidean load and reuse it
+        # so all three classify the same FRACTION of pairs as "reachable",
+        # making M4 differences reflect directional structure (cone vs ball)
+        # rather than threshold tuning.
+        base_rate_path = Path(cfg.output_dir) / "d2_base_rate.json"
+        perm = torch.randperm(n_ev, device=es_lat.device)
+        s_neg_eval = esn_lat[:n_ev][perm]
+
+        if cfg.geometry == "lorentzian":
+            m4f = m4_fair(
+                trainer.metric, es_lat[:n_ev], esn_lat[:n_ev], s_neg_eval,
+                geometry="lorentzian", base_rate=None,
+            )
+            os.makedirs(cfg.output_dir, exist_ok=True)
+            with open(base_rate_path, "w") as f:
+                json.dump({"base_rate": m4f["m4f_base_rate"]}, f, indent=2)
+            print(f"  [M4-fair] Lorentzian auto-calibrated base_rate="
+                  f"{m4f['m4f_base_rate']:.4f} → saved to {base_rate_path}")
+        else:
+            if base_rate_path.exists():
+                with open(base_rate_path) as f:
+                    shared_rate = json.load(f)["base_rate"]
+                print(f"  [M4-fair] Loaded Lorentzian base_rate="
+                      f"{shared_rate:.4f} for fair comparison")
+            else:
+                print(f"  [M4-fair] [WARN] {base_rate_path} not found. "
+                      f"Run Lorentzian first for fair comparison. "
+                      f"Falling back to base_rate=0.5.")
+                shared_rate = 0.5
+            m4f = m4_fair(
+                trainer.metric, es_lat[:n_ev], esn_lat[:n_ev], s_neg_eval,
+                geometry=cfg.geometry, base_rate=shared_rate,
+            )
+
     print(f"\n--- D2 Results ({cfg.geometry}) ---")
-    print(f"M1 (time-likeness rate): {m1:.4f}")
-    print(f"M4 (cone Jaccard):       {m4['jaccard']:.4f}  [held-out articles]")
-    print(f"M4 (cone precision):     {m4['precision']:.4f}")
-    print(f"M4 (cone recall):        {m4['recall']:.4f}")
-    print(f"M5 (predictive NLL):     {m5:.4f}")
+    print(f"M1 (time-likeness rate):        {m1:.4f}")
+    print(f"M4 raw (cone Jaccard):          {m4['jaccard']:.4f}  [diagnostic]")
+    print(f"M4 raw (cone precision):        {m4['precision']:.4f}")
+    print(f"M4 raw (cone recall):           {m4['recall']:.4f}")
+    print(f"M4 fair (Jaccard):              {m4f['m4f_jaccard']:.4f}  "
+          f"[base_rate={m4f['m4f_base_rate']:.4f}]")
+    print(f"M4 fair (precision):            {m4f['m4f_precision']:.4f}")
+    print(f"M4 fair (recall):               {m4f['m4f_recall']:.4f}")
+    print(f"M5 (predictive NLL):            {m5:.4f}")
 
     # Save
     os.makedirs(cfg.output_dir, exist_ok=True)
     results = {
-        "m1": m1, "m4_jaccard": m4["jaccard"],
-        "m4_precision": m4["precision"], "m4_recall": m4["recall"],
-        "m5": m5, "geometry": cfg.geometry, "has_semantic": has_lm,
+        "m1": m1,
+        "m4raw_jaccard": m4["jaccard"],
+        "m4raw_precision": m4["precision"],
+        "m4raw_recall": m4["recall"],
+        "m4fair_jaccard": m4f["m4f_jaccard"],
+        "m4fair_precision": m4f["m4f_precision"],
+        "m4fair_recall": m4f["m4f_recall"],
+        "m4fair_base_rate": m4f["m4f_base_rate"],
+        "m5": m5,
+        "geometry": cfg.geometry,
+        "has_semantic": has_lm,
         "eval_on_held_out_articles": True,
     }
     with open(os.path.join(cfg.output_dir, f"d2_results_{cfg.geometry}.json"), "w") as f:
