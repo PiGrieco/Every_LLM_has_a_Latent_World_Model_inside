@@ -375,16 +375,123 @@ def m5_predictive_nll(
     s_next: torch.Tensor,
 ) -> float:
     """
-    M5: Predictive quality.
+    M5 continuous (DIAGNOSTIC ONLY — not the thesis metric).
 
-    Average negative log-likelihood under q_θ on held-out transitions.
-    Lower is better — the world model assigns high probability to
-    actually observed transitions.
+    Average negative log-likelihood under the Gaussian world model q_θ
+    on held-out transitions. Kept for backward compatibility and as a
+    cheap sanity check.
+
+    Why we do NOT rely on this value to compare geometries:
+    `ConditionalGaussianWorldModel` clamps log-variance at
+    `min_logvar = -10`. With latent dim D=16, a fully collapsed variance
+    (σ² = e^{-10}) plus a perfect mean gives a theoretical NLL floor of
+
+        floor = 0.5 · (D·log(2π) + D·min_logvar)  ≈  -65.297
+
+    In practice, Riemannian/Euclidean baselines on D2 land at ≈ -65.29:
+    that is *variance collapse*, not predictive skill. Use
+    `m5_discrete_rank` for a geometry-fair, clamp-invariant assessment
+    based on candidate-set ranking — that's the metric aligned with the
+    paper's Gibbsian formulation.
 
     Returns:
         nll: float, average -log q_θ(s_{t+1} | s_t)
     """
     return world_model.neg_log_prob(s, s_next).mean().item()
+
+
+def m5_discrete_rank(
+    world_model,
+    lagrangian,
+    s: torch.Tensor,
+    s_next: torch.Tensor,
+    candidate_size: int = 32,
+    seed: int = 0,
+) -> dict:
+    """
+    M5 discrete: ranking of the true next state inside a candidate set.
+
+    For every (s_t, s_{t+1}) pair we build a C1 in-batch candidate set
+    with the true next at index 0, then evaluate two distributions over
+    the set:
+
+      - q_θ: softmax of the world model's log-densities
+             (``world_model.log_prob_candidates``)
+      - K_θ: softmax of the negative Lagrangian (the Gibbs kernel)
+
+    For each we report
+
+      - ``top1_acc``    : P[argmax = true]
+      - ``top5_acc``    : P[true ∈ top-5]
+      - ``mean_rank``   : average 1-based rank of the true candidate
+                         (1 = perfect, C = worst; ties are optimistic)
+      - ``nll_on_set``  : -E[log p(true | set)] with p normalized over
+                         the C candidates — crucially invariant to
+                         variance clamping (unlike ``m5_predictive_nll``)
+
+    Because the normalization is over a fixed-size discrete set, a
+    geometry cannot "cheat" by collapsing its continuous density; the
+    metric rewards only actual ranking quality.
+
+    Args:
+        world_model: module exposing ``log_prob_candidates(s, cands)``.
+        lagrangian: module callable as ``lagrangian(s_flat, c_flat)``.
+        s: (N, D) current states.
+        s_next: (N, D) true next states.
+        candidate_size: size C of the candidate set (default 32).
+        seed: seed used for candidate sampling (forked from the global
+            RNG so the call is reproducible without side effects).
+
+    Returns:
+        dict with keys q_top1_acc, q_top5_acc, q_mean_rank,
+        q_nll_on_set, K_top1_acc, K_top5_acc, K_mean_rank, K_nll_on_set.
+    """
+    from ..training.candidates import build_candidate_set_c1
+
+    # Deterministic candidate sampling, without polluting the global RNG.
+    with torch.random.fork_rng(devices=[s.device] if s.is_cuda else []):
+        torch.manual_seed(seed)
+        candidates, _true_idx = build_candidate_set_c1(
+            s, s_next, candidate_size=candidate_size
+        )
+    # By construction of C1, the true next is always at column 0.
+
+    batch, n_cand, dim = candidates.shape
+
+    # ---- q_θ: world-model log-densities, normalized over the set ----
+    q_log_probs = world_model.log_prob_candidates(s, candidates).log_softmax(dim=-1)
+
+    # ---- K_θ: Gibbs kernel from the Lagrangian, normalized over the set ----
+    s_flat = s.unsqueeze(1).expand(-1, n_cand, -1).reshape(-1, dim)
+    c_flat = candidates.reshape(-1, dim)
+    K_logits = (-lagrangian(s_flat, c_flat)).reshape(batch, n_cand)
+    K_log_probs = K_logits.log_softmax(dim=-1)
+
+    def _stats(log_probs: torch.Tensor) -> dict:
+        """Compute top-k / mean-rank / nll stats assuming true at col 0."""
+        n_top = min(5, log_probs.shape[-1])
+        top1 = (log_probs.argmax(dim=-1) == 0).float().mean().item()
+        top5_idx = log_probs.topk(n_top, dim=-1).indices
+        top5 = (top5_idx == 0).any(dim=-1).float().mean().item()
+        lp0 = log_probs[:, :1]
+        # Optimistic rank: count strictly greater entries (ties with the
+        # true candidate do not penalize).
+        rank = (log_probs > lp0).sum(dim=-1).float() + 1.0
+        mean_rank = rank.mean().item()
+        nll = -log_probs[:, 0].mean().item()
+        return {
+            "top1_acc": top1,
+            "top5_acc": top5,
+            "mean_rank": mean_rank,
+            "nll_on_set": nll,
+        }
+
+    q_stats = _stats(q_log_probs)
+    K_stats = _stats(K_log_probs)
+
+    out = {f"q_{k}": v for k, v in q_stats.items()}
+    out.update({f"K_{k}": v for k, v in K_stats.items()})
+    return out
 
 
 def m6_branching_signal(
@@ -484,6 +591,11 @@ def compute_all_metrics(
         results.update(
             {f"m4fair_{k[len('m4f_'):]}": v for k, v in m4f.items()}
         )
+
+        # ---- M5 discrete: candidate-set ranking, variance-clamp invariant ----
+        # The thesis metric for the world model / Gibbs kernel quality.
+        m5d = m5_discrete_rank(world_model, lagrangian, s[:n_ev], s_next[:n_ev])
+        results.update({f"m5disc_{k}": v for k, v in m5d.items()})
 
     # M3: Branching separation (needs branch data)
     if branch_data:

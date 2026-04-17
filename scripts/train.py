@@ -337,7 +337,9 @@ def run_d2(cfg):
     from pathlib import Path
     from src.data.preprocessing import preprocess_trajectory_dataset
     from src.training.trainer import WorldModelTrainer
-    from src.evaluation.metrics import m1_timelike_rate, m5_predictive_nll
+    from src.evaluation.metrics import (
+        m1_timelike_rate, m5_predictive_nll, m5_discrete_rank,
+    )
 
     print("\n" + "=" * 60)
     print("D2: WIKITEXT-103 REAL-TEXT EXPERIMENT")
@@ -444,12 +446,21 @@ def run_d2(cfg):
         m1 = m1_timelike_rate(trainer.metric, es_lat, esn_lat)
         m5 = m5_predictive_nll(trainer.world_model, es_lat, esn_lat)
 
+        # Eval subset size shared between M4 and M5 discrete
+        n_ev = min(256, len(es_lat))
+
+        # M5 discrete: candidate-set ranking — the thesis-aligned version
+        # of M5, invariant to the continuous world model's variance clamp.
+        m5d = m5_discrete_rank(
+            trainer.world_model, trainer.lagrangian,
+            es_lat[:n_ev], esn_lat[:n_ev],
+        )
+
         # ---- M4 raw cone alignment on held-out articles ----
         # Tautological for Euclidean/Riemannian where squared_interval ≥ 0,
         # but kept as a diagnostic for the Lorentzian case.
         from src.training.candidates import build_candidate_set_c1
         from src.evaluation.metrics import m4_cone_alignment, m4_fair
-        n_ev = min(256, len(es_lat))
         cands, _ = build_candidate_set_c1(es_lat[:n_ev], esn_lat[:n_ev], 32)
         m4 = m4_cone_alignment(trainer.metric, trainer.lagrangian,
                                es_lat[:n_ev], cands)
@@ -491,15 +502,21 @@ def run_d2(cfg):
             )
 
     print(f"\n--- D2 Results ({cfg.geometry}) ---")
-    print(f"M1 (time-likeness rate):        {m1:.4f}")
-    print(f"M4 raw (cone Jaccard):          {m4['jaccard']:.4f}  [diagnostic]")
-    print(f"M4 raw (cone precision):        {m4['precision']:.4f}")
-    print(f"M4 raw (cone recall):           {m4['recall']:.4f}")
-    print(f"M4 fair (Jaccard):              {m4f['m4f_jaccard']:.4f}  "
+    print(f"M1 (time-likeness rate):             {m1:.4f}")
+    print(f"M4 raw (cone Jaccard):               {m4['jaccard']:.4f}  [diagnostic]")
+    print(f"M4 raw (cone precision):             {m4['precision']:.4f}")
+    print(f"M4 raw (cone recall):                {m4['recall']:.4f}")
+    print(f"M4 fair (Jaccard):                   {m4f['m4f_jaccard']:.4f}  "
           f"[base_rate={m4f['m4f_base_rate']:.4f}]")
-    print(f"M4 fair (precision):            {m4f['m4f_precision']:.4f}")
-    print(f"M4 fair (recall):               {m4f['m4f_recall']:.4f}")
-    print(f"M5 (predictive NLL):            {m5:.4f}")
+    print(f"M4 fair (precision):                 {m4f['m4f_precision']:.4f}")
+    print(f"M4 fair (recall):                    {m4f['m4f_recall']:.4f}")
+    print(f"M5 (continuous NLL, diagnostic only): {m5:.4f}")
+    print(f"M5 top-1 acc (world model):   {m5d['q_top1_acc']:.4f}")
+    print(f"M5 top-5 acc (world model):   {m5d['q_top5_acc']:.4f}")
+    print(f"M5 top-1 acc (Gibbs kernel):  {m5d['K_top1_acc']:.4f}")
+    print(f"M5 top-5 acc (Gibbs kernel):  {m5d['K_top5_acc']:.4f}")
+    print(f"M5 mean rank   (q / K):       {m5d['q_mean_rank']:.2f} / {m5d['K_mean_rank']:.2f}")
+    print(f"M5 nll-on-set  (q / K):       {m5d['q_nll_on_set']:.4f} / {m5d['K_nll_on_set']:.4f}")
 
     # Save
     os.makedirs(cfg.output_dir, exist_ok=True)
@@ -517,6 +534,8 @@ def run_d2(cfg):
         "has_semantic": has_lm,
         "eval_on_held_out_articles": True,
     }
+    # M5 discrete (candidate-set ranking) — thesis metric
+    results.update({f"m5disc_{k}": v for k, v in m5d.items()})
     with open(os.path.join(cfg.output_dir, f"d2_results_{cfg.geometry}.json"), "w") as f:
         json.dump(results, f, indent=2)
 
