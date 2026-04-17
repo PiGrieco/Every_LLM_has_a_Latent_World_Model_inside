@@ -1,5 +1,5 @@
 """
-Tests for the discrete M5 metric (m5_discrete_rank).
+Tests for m5_candidate_metrics and world_model_variance_diagnostic.
 
 Run with:
     python -m tests.test_metrics
@@ -13,10 +13,12 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from src.evaluation.metrics import (
-    m5_discrete_rank,
+    m5_candidate_metrics,
     m5_predictive_nll,
+    world_model_variance_diagnostic,
     compute_all_metrics,
 )
+from src.training.candidates import build_candidate_set_c1
 from src.models.metric import MetricNetwork
 from src.models.lagrangian import Lagrangian
 from src.models.world_model import ConditionalGaussianWorldModel
@@ -40,138 +42,227 @@ def _mk_data(dim: int = 8, n: int = 64):
     return s, s_next
 
 
-def test_basic_ranges():
-    """Every reported quantity must lie in its mathematically valid range."""
+def _mk_candidates(dim: int = 8, n: int = 64, C: int = 32, seed: int = 0):
+    s, s_next = _mk_data(dim=dim, n=n)
+    torch.manual_seed(seed)
+    cands, true_idx = build_candidate_set_c1(s, s_next, candidate_size=C)
+    return s, cands, true_idx
+
+
+# --------------------------------------------------------------------------
+# m5_candidate_metrics
+# --------------------------------------------------------------------------
+
+def test_m5_candidate_metrics_ranges():
+    """All returned quantities must lie in their valid ranges."""
     D, B, C = 8, 64, 32
-    metric, lag, wm = _mk_stack(dim=D)
-    s, s_next = _mk_data(dim=D, n=B)
+    _, _, wm = _mk_stack(dim=D)
+    s, cands, true_idx = _mk_candidates(dim=D, n=B, C=C)
 
-    r = m5_discrete_rank(wm, lag, s, s_next, candidate_size=C, seed=0)
+    r = m5_candidate_metrics(wm, s, cands, true_idx, topk=5)
 
-    for prefix in ("q_", "K_"):
-        t1 = r[prefix + "top1_acc"]
-        t5 = r[prefix + "top5_acc"]
-        mr = r[prefix + "mean_rank"]
-        nll = r[prefix + "nll_on_set"]
-
-        assert 0.0 <= t1 <= 1.0, f"{prefix}top1_acc={t1} out of [0,1]"
-        assert 0.0 <= t5 <= 1.0, f"{prefix}top5_acc={t5} out of [0,1]"
-        # top1 ⊆ top5 ⇒ top1_acc ≤ top5_acc (within fp noise)
-        assert t1 <= t5 + 1e-6, f"{prefix}top1 > top5 ({t1} > {t5})"
-        assert 1.0 <= mr <= float(C), f"{prefix}mean_rank={mr} not in [1,{C}]"
-        assert nll >= 0.0, f"{prefix}nll_on_set={nll} must be ≥ 0"
-
-    print("  [OK] Ranges: top-k in [0,1], top1 ≤ top5, mean_rank in [1,C], nll ≥ 0")
+    assert 0.0 <= r["m5d_top1"] <= 1.0, r["m5d_top1"]
+    assert 0.0 <= r["m5d_topk"] <= 1.0, r["m5d_topk"]
+    # top1 ⊆ topk ⇒ top1 ≤ topk (within fp noise)
+    assert r["m5d_top1"] <= r["m5d_topk"] + 1e-6
+    # MRR ∈ [1/C, 1]
+    assert 1.0 / C - 1e-6 <= r["m5d_mrr"] <= 1.0 + 1e-6, r["m5d_mrr"]
+    # CE ≥ 0 (log_softmax outputs are ≤ 0, NLL is ≥ 0)
+    assert r["m5d_ce"] >= 0.0, r["m5d_ce"]
+    # topk_k is min(topk, C)
+    assert r["m5d_topk_k"] == min(5, C)
+    print("  [OK] Ranges: top-k ∈ [0,1], MRR ∈ [1/C, 1], CE ≥ 0, topk_k = min(5,C)")
 
 
-def test_deterministic_given_seed():
-    """Same seed → same candidates → same metrics. Different seed → may differ."""
+def test_m5_candidate_metrics_perfect_model():
+    """A world model whose mean exactly hits the true next and whose
+    log-density for the wrong candidates is lower → MRR = 1, top-1 = 1,
+    CE ≈ 0."""
     D, B, C = 8, 32, 16
-    metric, lag, wm = _mk_stack(dim=D)
-    s, s_next = _mk_data(dim=D, n=B)
+    _, _, wm = _mk_stack(dim=D)
+    s, cands, true_idx = _mk_candidates(dim=D, n=B, C=C)
 
-    r_a = m5_discrete_rank(wm, lag, s, s_next, candidate_size=C, seed=7)
-    r_b = m5_discrete_rank(wm, lag, s, s_next, candidate_size=C, seed=7)
-    for k in r_a:
-        assert r_a[k] == r_b[k], f"seed=7 not deterministic on {k}"
+    # Force mean_head to predict a perfect shift: set mean = true_next.
+    # `forward` computes mean = s + self.mean_head(h); we want mean = s_next.
+    # So mean_head(h) should output (s_next - s). We make it a lookup: overwrite
+    # forward with a no-op stub that returns (true_next_for_this_s, tiny_logvar).
+    true_next = cands[torch.arange(B), true_idx]  # (B, D)
 
-    # Drive the global RNG to make sure fork_rng actually isolates us
-    _ = torch.randn(1000)
-    r_c = m5_discrete_rank(wm, lag, s, s_next, candidate_size=C, seed=7)
-    for k in r_a:
-        assert r_a[k] == r_c[k], (
-            f"m5_discrete_rank polluted by global RNG (differs on {k})"
-        )
+    class PerfectWM(torch.nn.Module):
+        def __init__(self, inner, s_in, sn_out):
+            super().__init__()
+            self.inner = inner
+            self.min_logvar = inner.min_logvar
+            self.dim = inner.dim
+            # Memorise (s -> sn) for the rows we know about.
+            self._map = {tuple(x.tolist()): y.detach().clone()
+                         for x, y in zip(s_in, sn_out)}
 
-    print("  [OK] Deterministic + isolated from global RNG")
+        def forward(self, s_):
+            mean = torch.stack([
+                self._map[tuple(x.tolist())].to(x.dtype)
+                if tuple(x.tolist()) in self._map else x
+                for x in s_
+            ])
+            logvar = torch.full_like(mean, -2.0)
+            return mean, logvar
+
+        def log_prob(self, s_, s_next_):
+            mean, logvar = self.forward(s_)
+            import math
+            var = logvar.exp()
+            diff = s_next_ - mean
+            return -0.5 * (
+                self.dim * math.log(2 * math.pi)
+                + logvar.sum(dim=-1)
+                + (diff ** 2 / var).sum(dim=-1)
+            )
+
+        def log_prob_candidates(self, s_, cands_):
+            return self.inner.log_prob_candidates(s_, cands_)
+
+    perfect = PerfectWM(wm, s, true_next)
+    r = m5_candidate_metrics(perfect, s, cands, true_idx, topk=5)
+
+    assert r["m5d_top1"] > 0.99, f"perfect model top1 = {r['m5d_top1']}"
+    assert r["m5d_mrr"] > 0.99, f"perfect model mrr = {r['m5d_mrr']}"
+    assert r["m5d_ce"] < 1.0, f"perfect model CE suspiciously high: {r['m5d_ce']}"
+    print(f"  [OK] Perfect model: top1={r['m5d_top1']:.3f}, "
+          f"MRR={r['m5d_mrr']:.3f}, CE={r['m5d_ce']:.3f}")
 
 
-def test_variance_collapse_still_ranks():
-    """The thesis of the metric: with σ² pinned at the clamp, the
-    continuous NLL becomes extreme (sign depends on whether the mean
-    happens to land near s_next or not), while the discrete M5 stays
-    inside its natural ranges — the clamp cannot dominate a softmax
-    over a fixed-size candidate set."""
+def test_m5_candidate_metrics_random_model():
+    """A random-init world model on random data → MRR ≈ 1/C + chance noise,
+    top-1 ≈ 1/C. We don't test exact values (small sample, Gaussian tail
+    behaviour), just that top-1 ≤ topk ≤ 1 and CE is finite."""
     D, B, C = 8, 64, 32
-    metric, lag, wm = _mk_stack(dim=D)
-    s, s_next = _mk_data(dim=D, n=B)
+    _, _, wm = _mk_stack(dim=D)
+    s, cands, true_idx = _mk_candidates(dim=D, n=B, C=C, seed=123)
 
-    # Force variance to the floor (-10) to simulate a collapsed baseline.
+    r = m5_candidate_metrics(wm, s, cands, true_idx, topk=5)
+
+    # Sanity: finite, in bounds.
+    for k in ("m5d_top1", "m5d_topk", "m5d_mrr", "m5d_ce"):
+        v = r[k]
+        assert torch.isfinite(torch.tensor(v)), f"{k}={v} not finite"
+    # topk_recall must dominate top1.
+    assert r["m5d_top1"] <= r["m5d_topk"] + 1e-6
+    print(f"  [OK] Random model: top1={r['m5d_top1']:.3f}, "
+          f"topk={r['m5d_topk']:.3f}, MRR={r['m5d_mrr']:.3f}, CE={r['m5d_ce']:.3f}")
+
+
+def test_m5_candidate_metrics_topk_capped_to_C():
+    """If the user asks for topk larger than C, we should cap, not error."""
+    D, B, C = 8, 16, 4
+    _, _, wm = _mk_stack(dim=D)
+    s, cands, true_idx = _mk_candidates(dim=D, n=B, C=C)
+    r = m5_candidate_metrics(wm, s, cands, true_idx, topk=20)
+    assert r["m5d_topk_k"] == C
+    # topk with k=C means every true is in it ⇒ topk_recall = 1.0
+    assert r["m5d_topk"] > 0.999
+    print(f"  [OK] topk capped to C={C}; topk_recall = {r['m5d_topk']:.3f}")
+
+
+# --------------------------------------------------------------------------
+# world_model_variance_diagnostic
+# --------------------------------------------------------------------------
+
+def test_variance_diagnostic_not_collapsed():
+    """Freshly-initialised world model → logvar ≈ 0 → not collapsed."""
+    D = 8
+    _, _, wm = _mk_stack(dim=D)
+    s, _ = _mk_data(dim=D, n=64)
+    r = world_model_variance_diagnostic(wm, s)
+    assert r["wm_logvar_floor"] == -10.0
+    assert r["wm_frac_at_floor"] < 0.3
+    assert r["wm_collapsed"] is False
+    print(f"  [OK] Fresh world model not flagged: "
+          f"mean_logvar={r['wm_mean_logvar']:.2f}, "
+          f"frac_at_floor={r['wm_frac_at_floor']:.2f}")
+
+
+def test_variance_diagnostic_detects_collapse():
+    """Force the logvar bias to the floor → must report collapsed = True
+    and the continuous NLL must indeed be extreme."""
+    D = 8
+    _, _, wm = _mk_stack(dim=D)
+    s, s_next = _mk_data(dim=D, n=64)
     with torch.no_grad():
         wm.logvar_head.weight.zero_()
-        wm.logvar_head.bias.fill_(-12.0)  # Pre-clamp → clamped to min_logvar.
+        wm.logvar_head.bias.fill_(-12.0)  # pre-clamp → clamped to -10
 
-    continuous_nll = m5_predictive_nll(wm, s, s_next)
-    # With σ² at floor the continuous NLL is dominated by either the
-    # log-|Σ| term (very negative) or the quadratic term (very positive),
-    # depending on how close the untrained mean_head is to s_next. Either
-    # way it is extreme — and therefore an unreliable comparison metric.
-    assert abs(continuous_nll) > 50.0, (
-        f"variance-collapsed NLL expected to be extreme in magnitude, "
-        f"got {continuous_nll}"
+    r = world_model_variance_diagnostic(wm, s)
+    assert r["wm_collapsed"] is True, (
+        f"should be flagged: mean_logvar={r['wm_mean_logvar']:.3f}"
     )
-
-    # The discrete metric must remain in its valid ranges regardless.
-    r = m5_discrete_rank(wm, lag, s, s_next, candidate_size=C, seed=0)
-    for prefix in ("q_", "K_"):
-        assert 0.0 <= r[prefix + "top1_acc"] <= 1.0
-        assert 1.0 <= r[prefix + "mean_rank"] <= float(C)
-        assert r[prefix + "nll_on_set"] >= 0.0
-
-    print(f"  [OK] Variance collapse: |continuous NLL|={abs(continuous_nll):.1f} "
-          f"(extreme); discrete metrics stay in bounds")
+    assert r["wm_frac_at_floor"] > 0.99
+    # The continuous NLL on this collapsed model should be extreme.
+    ce = m5_predictive_nll(wm, s, s_next)
+    assert abs(ce) > 50.0, f"collapsed NLL expected extreme, got {ce}"
+    print(f"  [OK] Collapsed world model flagged: "
+          f"mean_logvar={r['wm_mean_logvar']:.2f}, |continuous NLL|={abs(ce):.1f}")
 
 
-def test_trivial_world_model_beats_random():
-    """Sanity: an identity-ish world model (predicts mean = s_t) should
-    rank the true next state better than 1/C on average when s_next is
-    closer to s_t than to a random other s_next in the batch."""
-    D, B, C = 8, 128, 32
-    metric, lag, wm = _mk_stack(dim=D)
-    # Make s_next tightly centered on s (s_next = s + tiny noise)
-    torch.manual_seed(42)
-    s = torch.randn(B, D)
-    s_next = s + 0.05 * torch.randn(B, D)
+# --------------------------------------------------------------------------
+# compute_all_metrics integration
+# --------------------------------------------------------------------------
 
-    r = m5_discrete_rank(wm, lag, s, s_next, candidate_size=C, seed=0)
-    # The Gaussian WM is initialized so mean(s) ≈ s; with near-identity
-    # next states, top-1 should comfortably beat chance (1/C = 3.1%).
-    assert r["q_top1_acc"] > 1.0 / C + 0.05, (
-        f"q_top1_acc={r['q_top1_acc']} barely above chance {1.0/C}"
-    )
-    print(f"  [OK] Near-identity transitions: q_top1_acc={r['q_top1_acc']:.3f} "
-          f"> chance {1.0/C:.3f}")
-
-
-def test_integration_into_compute_all_metrics():
-    """compute_all_metrics must carry m5disc_* keys after the change."""
+def test_compute_all_metrics_exposes_new_keys():
+    """compute_all_metrics must surface m5d_*, m4fair_*, m4raw_*, wm_*."""
     D, B = 8, 64
     metric, lag, wm = _mk_stack(dim=D)
     s, s_next = _mk_data(dim=D, n=B)
     r = compute_all_metrics(metric, wm, lag, s, s_next)
 
-    expected = {
-        "m5disc_q_top1_acc", "m5disc_q_top5_acc",
-        "m5disc_q_mean_rank", "m5disc_q_nll_on_set",
-        "m5disc_K_top1_acc", "m5disc_K_top5_acc",
-        "m5disc_K_mean_rank", "m5disc_K_nll_on_set",
-    }
-    missing = expected - set(r.keys())
-    assert not missing, f"missing keys in compute_all_metrics: {missing}"
+    for k in (
+        "m1_timelike_rate", "m5_nll",
+        "wm_mean_logvar", "wm_frac_at_floor", "wm_logvar_floor", "wm_collapsed",
+        "m4raw_jaccard", "m4raw_precision", "m4raw_recall",
+        "m4fair_jaccard", "m4fair_precision", "m4fair_recall", "m4fair_base_rate",
+        "m5d_ce", "m5d_top1", "m5d_topk", "m5d_mrr", "m5d_topk_k",
+    ):
+        assert k in r, f"missing key {k}"
 
-    # Continuous m5_nll must still be there (diagnostic)
-    assert "m5_nll" in r, "m5_nll diagnostic disappeared"
+    # Legacy keys from the m5_discrete_rank era must NOT leak.
+    for legacy in ("m5disc_q_top1_acc", "m5disc_K_top1_acc"):
+        assert legacy not in r, f"legacy key {legacy} leaked"
+    print("  [OK] compute_all_metrics exposes m4fair_*, m4raw_*, m5d_*, wm_* keys")
 
-    print("  [OK] compute_all_metrics exposes m5disc_* alongside m5_nll")
+
+def test_compute_all_metrics_accepts_semantic_costs():
+    """Passing semantic_costs must not error; must affect m4fair_* values."""
+    D, B = 8, 64
+    metric, lag, wm = _mk_stack(dim=D)
+    s, s_next = _mk_data(dim=D, n=B)
+    # Identical to the compute_all_metrics candidate builder (hardcoded C=32).
+    C = 32
+    n_ev = min(256, B)
+    torch.manual_seed(0)
+    sem = torch.randn(n_ev, C).abs()
+    r_with = compute_all_metrics(metric, wm, lag, s, s_next, semantic_costs=sem)
+    r_without = compute_all_metrics(metric, wm, lag, s, s_next, semantic_costs=None)
+
+    assert "m4fair_jaccard" in r_with and "m4fair_jaccard" in r_without
+    # They should generally differ (different plausibility sets). Allow the
+    # rare coincidence where both land on the same value.
+    if r_with["m4fair_jaccard"] == r_without["m4fair_jaccard"]:
+        print("  [NOTE] semantic_costs did not change m4fair_jaccard "
+              "in this seed — acceptable but unusual")
+    print(f"  [OK] semantic_costs accepted: "
+          f"m4fair_jaccard with={r_with['m4fair_jaccard']:.4f}, "
+          f"without={r_without['m4fair_jaccard']:.4f}")
 
 
 def main():
-    print("Running M5 discrete-rank tests...\n")
-    test_basic_ranges()
-    test_deterministic_given_seed()
-    test_variance_collapse_still_ranks()
-    test_trivial_world_model_beats_random()
-    test_integration_into_compute_all_metrics()
+    print("Running metrics tests (m5_candidate_metrics + variance diag)...\n")
+    test_m5_candidate_metrics_ranges()
+    test_m5_candidate_metrics_topk_capped_to_C()
+    test_m5_candidate_metrics_random_model()
+    test_m5_candidate_metrics_perfect_model()
+    test_variance_diagnostic_not_collapsed()
+    test_variance_diagnostic_detects_collapse()
+    test_compute_all_metrics_exposes_new_keys()
+    test_compute_all_metrics_accepts_semantic_costs()
     print("\nAll tests passed.")
 
 

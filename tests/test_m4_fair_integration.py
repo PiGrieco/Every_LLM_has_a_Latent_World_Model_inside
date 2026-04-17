@@ -8,6 +8,9 @@ Verifies:
   3. Lorentzian self-calibration produces a base_rate that, when passed
      to a Riemannian metric on the same data, yields a Riemannian
      m4fair_base_rate within a small tolerance.
+  4. The new m4_fair_candidates contract: non-Lorentzian geometries MUST
+     receive an explicit base_rate (no silent default); the function
+     raises ValueError when called without one.
 
 Run with:
     python -m tests.test_m4_fair_integration
@@ -20,7 +23,12 @@ import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from src.evaluation.metrics import compute_all_metrics, m4_fair
+from src.evaluation.metrics import (
+    compute_all_metrics,
+    m4_fair,
+    m4_fair_candidates,
+)
+from src.training.candidates import build_candidate_set_c1
 from src.models.metric import MetricNetwork
 from src.models.lagrangian import Lagrangian
 from src.models.world_model import ConditionalGaussianWorldModel
@@ -62,18 +70,42 @@ def test_compute_all_metrics_has_both_m4_variants():
 
 
 def test_euclidean_m4raw_is_tautologically_zero():
-    """squared_interval ≥ 0 for Euclidean → metric cone is empty → M4_raw = 0."""
+    """squared_interval ≥ 0 for Euclidean → metric cone is empty → M4_raw = 0.
+    m4_fair_candidates, by contrast, yields a meaningful non-zero Jaccard
+    when a base_rate is provided."""
     metric, lag, wm = _mk_stack("euclidean")
     s, s_next = _mk_data()
-    r = compute_all_metrics(metric, wm, lag, s, s_next)
-    # Jaccard is 0 because metric cone is empty (intervals all > 0)
+    # The new m4_fair_candidates requires an explicit base_rate for
+    # non-Lorentzian geometries (no silent default). We pass 0.7 here.
+    r = compute_all_metrics(metric, wm, lag, s, s_next, base_rate=0.7)
     assert r["m4raw_jaccard"] == 0.0, (
         f"expected m4raw_jaccard=0 for Euclidean, got {r['m4raw_jaccard']}"
     )
-    # m4fair, by contrast, should be non-zero for the base_rate we pass
-    r2 = compute_all_metrics(metric, wm, lag, s, s_next, base_rate=0.7)
-    assert 0.0 < r2["m4fair_jaccard"] <= 1.0
+    assert 0.0 < r["m4fair_jaccard"] <= 1.0, (
+        f"m4fair_jaccard={r['m4fair_jaccard']} not in (0, 1]"
+    )
     print("  [OK] Euclidean: m4raw_jaccard=0 (tautologico), m4fair_jaccard>0")
+
+
+def test_non_lorentzian_requires_explicit_base_rate():
+    """m4_fair_candidates must refuse to run on non-Lorentzian geometries
+    without an explicit base_rate (to prevent silent uncoupled comparisons
+    that would be meaningless)."""
+    metric, lag, _ = _mk_stack("riemannian")
+    s, s_next = _mk_data(n=64)
+    cands, _ = build_candidate_set_c1(s, s_next, candidate_size=32)
+    try:
+        m4_fair_candidates(
+            metric, lag, s, cands,
+            geometry="riemannian", base_rate=None,
+        )
+    except ValueError as e:
+        assert "base_rate" in str(e), f"wrong error message: {e}"
+        print("  [OK] Non-Lorentzian without base_rate raises ValueError")
+        return
+    raise AssertionError(
+        "m4_fair_candidates should have raised on Riemannian + base_rate=None"
+    )
 
 
 def test_base_rate_is_honoured():
@@ -111,40 +143,31 @@ def test_lorentzian_calibration_shared_with_baseline():
     print(f"  [OK] Cross-geometry coupling: shared base_rate={shared:.4f}")
 
 
-def test_m4_fair_independent_invocation_matches():
-    """compute_all_metrics(base_rate=p) must match a direct m4_fair call
-    with the same arguments (up to RNG for the permutation, which is
-    deterministic here via manual_seed)."""
-    metric, lag, wm = _mk_stack("lorentzian")
-    s, s_next = _mk_data(n=200)
-
-    torch.manual_seed(42)
-    r = compute_all_metrics(metric, wm, lag, s, s_next, base_rate=0.6)
-
-    torch.manual_seed(42)
-    # compute_all_metrics truncates to min(256, N) and uses torch.randperm.
-    n_ev = min(256, s.shape[0])
-    # Re-create the same permutation: inside compute_all_metrics we call
-    # build_candidate_set_c1 BEFORE the permutation, so the RNG is advanced.
-    # We skip exact byte-parity and instead verify bounded agreement.
-    m4f_direct = m4_fair(
-        metric, s[:n_ev], s_next[:n_ev],
-        s_next[:n_ev][torch.randperm(n_ev)],
-        geometry="lorentzian", base_rate=0.6,
+def test_legacy_m4_fair_is_still_callable():
+    """The legacy shuffled-negatives m4_fair must remain importable and
+    functional (kept as a diagnostic; compute_all_metrics now uses
+    m4_fair_candidates internally)."""
+    metric, _, _ = _mk_stack("lorentzian")
+    s, s_next = _mk_data(n=64)
+    r = m4_fair(
+        metric, s, s_next,
+        s_next[torch.randperm(len(s_next))],
+        geometry="lorentzian", base_rate=None,
     )
-    # base_rate is deterministic given the input; jaccard differs because
-    # the permutation differs. Check that base_rate agrees exactly.
-    assert abs(r["m4fair_base_rate"] - m4f_direct["m4f_base_rate"]) < 1e-6
-    print("  [OK] m4_fair invocation inside compute_all_metrics is consistent")
+    assert "m4f_base_rate" in r
+    assert 0.0 <= r["m4f_base_rate"] <= 1.0
+    print(f"  [OK] Legacy m4_fair still callable: "
+          f"m4f_base_rate={r['m4f_base_rate']:.4f}")
 
 
 def main():
     print("Running M4-fair integration tests...\n")
     test_compute_all_metrics_has_both_m4_variants()
     test_euclidean_m4raw_is_tautologically_zero()
+    test_non_lorentzian_requires_explicit_base_rate()
     test_base_rate_is_honoured()
     test_lorentzian_calibration_shared_with_baseline()
-    test_m4_fair_independent_invocation_matches()
+    test_legacy_m4_fair_is_still_callable()
     print("\nAll tests passed.")
 
 

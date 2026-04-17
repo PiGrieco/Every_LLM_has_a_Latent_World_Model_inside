@@ -369,6 +369,120 @@ def m4_fair(
     }
 
 
+def m4_fair_candidates(
+    metric,
+    lagrangian,
+    s: torch.Tensor,
+    candidates: torch.Tensor,
+    geometry: str,
+    p: float = 0.8,
+    base_rate: float = None,
+    semantic_costs: torch.Tensor = None,
+) -> dict:
+    """
+    Fair M4 on candidate sets — geometry-agnostic, stack-aligned.
+
+    Supersedes ``m4_fair`` (which uses shuffled negatives + a quantile
+    threshold) in three ways:
+
+    1. **Same candidate set the model sees at training time** (not random
+       shuffles), so the evaluation matches the optimization objective.
+    2. **Reachable-set semantics that make sense for non-Lorentzian
+       baselines**: instead of thresholding on an interval quantile, we
+       pick the top-k candidates by squared interval with
+       ``k = round(base_rate · C)``. This guarantees all geometries
+       classify the same count of candidates as reachable, and "closer"
+       means the same thing in every geometry (small squared interval).
+    3. **Plausibility set optionally defined by the semantic surrogate
+       alone**, so the Lagrangian's geometric term does not bias the
+       reference set toward the geometry being evaluated ("the Lagrangian
+       judging itself" failure mode).
+
+    Definitions:
+
+      - Reachable:
+          * lorentzian           : {c : Δσ²(s, c) ≤ 0}   (inside light cone)
+          * riemannian/euclidean : top-k under Δσ² with k = round(base_rate·C)
+      - Plausible:
+          * if ``semantic_costs`` provided : top-p mass of softmax(-cost)
+          * else                           : top-p mass of softmax(-L_θ)
+
+    Args:
+        metric: MetricNetwork.
+        lagrangian: Lagrangian (used only when semantic_costs is None).
+        s: (B, D) current states.
+        candidates: (B, C, D) candidate next states.
+        geometry: "lorentzian" | "riemannian" | "euclidean".
+        p: mass cutoff for the probabilistic cone (default 0.8).
+        base_rate: reachable fraction. None means auto-calibrate
+            (Lorentzian only); baselines must receive the Lorentzian
+            value for a fair comparison.
+        semantic_costs: optional (B, C) per-candidate semantic costs
+            (e.g. from the trained semantic surrogate). When provided,
+            the plausibility set is defined without the geometric term.
+
+    Returns:
+        dict with m4f_jaccard, m4f_precision, m4f_recall, m4f_base_rate.
+    """
+    batch, C, D = candidates.shape
+
+    s_exp = s.unsqueeze(1).expand(-1, C, -1)
+    delta = candidates - s_exp
+    s_flat = s_exp.reshape(-1, D)
+    delta_flat = delta.reshape(-1, D)
+    intervals = metric.squared_interval(s_flat, delta_flat).reshape(batch, C)
+
+    # ---- Reachable set ----
+    if geometry == "lorentzian":
+        reachable = (intervals <= 0)
+        if base_rate is None:
+            base_rate = reachable.float().mean().item()
+    else:
+        if base_rate is None:
+            raise ValueError(
+                "m4_fair_candidates for non-Lorentzian needs base_rate "
+                "(typically from the Lorentzian run on the same split)."
+            )
+        k = max(1, int(round(base_rate * C)))
+        order = torch.argsort(intervals, dim=-1, descending=False)
+        reachable = torch.zeros_like(intervals, dtype=torch.bool)
+        reachable.scatter_(1, order[:, :k], True)
+
+    # ---- Plausibility set ----
+    if semantic_costs is not None:
+        logits = -semantic_costs
+    else:
+        c_flat = candidates.reshape(-1, D)
+        energies = lagrangian(s_flat, c_flat).reshape(batch, C)
+        logits = -energies
+
+    probs = torch.softmax(logits, dim=-1)
+    sorted_probs, sorted_idx = probs.sort(dim=-1, descending=True)
+    cumulative = sorted_probs.cumsum(dim=-1)
+
+    plausible = torch.zeros_like(reachable)
+    for i in range(batch):
+        cutoff = (cumulative[i] >= p).float().argmax().item()
+        top_idx = sorted_idx[i, : cutoff + 1]
+        plausible[i, top_idx] = True
+
+    intersection = (reachable & plausible).float().sum(dim=-1)
+    union = (reachable | plausible).float().sum(dim=-1)
+    reachable_size = reachable.float().sum(dim=-1)
+    plausible_size = plausible.float().sum(dim=-1)
+
+    jaccard = (intersection / union.clamp(min=1)).mean().item()
+    precision = (intersection / plausible_size.clamp(min=1)).mean().item()
+    recall = (intersection / reachable_size.clamp(min=1)).mean().item()
+
+    return {
+        "m4f_jaccard": jaccard,
+        "m4f_precision": precision,
+        "m4f_recall": recall,
+        "m4f_base_rate": base_rate,
+    }
+
+
 def m5_predictive_nll(
     world_model,
     s: torch.Tensor,
@@ -390,9 +504,11 @@ def m5_predictive_nll(
 
     In practice, Riemannian/Euclidean baselines on D2 land at ≈ -65.29:
     that is *variance collapse*, not predictive skill. Use
-    `m5_discrete_rank` for a geometry-fair, clamp-invariant assessment
-    based on candidate-set ranking — that's the metric aligned with the
-    paper's Gibbsian formulation.
+    `m5_candidate_metrics` for a geometry-fair, clamp-invariant
+    assessment based on candidate-set ranking — that's the metric
+    aligned with the paper's Gibbsian formulation. Run
+    `world_model_variance_diagnostic` alongside to flag when the
+    continuous NLL is dominated by the clamp.
 
     Returns:
         nll: float, average -log q_θ(s_{t+1} | s_t)
@@ -400,98 +516,116 @@ def m5_predictive_nll(
     return world_model.neg_log_prob(s, s_next).mean().item()
 
 
-def m5_discrete_rank(
+def world_model_variance_diagnostic(
     world_model,
-    lagrangian,
     s: torch.Tensor,
-    s_next: torch.Tensor,
-    candidate_size: int = 32,
-    seed: int = 0,
 ) -> dict:
     """
-    M5 discrete: ranking of the true next state inside a candidate set.
+    Flag Gaussian-world-model variance collapse.
 
-    For every (s_t, s_{t+1}) pair we build a C1 in-batch candidate set
-    with the true next at index 0, then evaluate two distributions over
-    the set:
+    The Gaussian ``ConditionalGaussianWorldModel`` clamps per-dim
+    log-variance at ``world_model.min_logvar`` (default -10). When
+    training pushes log-variance to the floor, the continuous M5 NLL
+    becomes dominated by the clamp (cf. the -65.30 floor for D=16) and
+    is no longer a meaningful comparison signal. This helper reports
 
-      - q_θ: softmax of the world model's log-densities
-             (``world_model.log_prob_candidates``)
-      - K_θ: softmax of the negative Lagrangian (the Gibbs kernel)
-
-    For each we report
-
-      - ``top1_acc``    : P[argmax = true]
-      - ``top5_acc``    : P[true ∈ top-5]
-      - ``mean_rank``   : average 1-based rank of the true candidate
-                         (1 = perfect, C = worst; ties are optimistic)
-      - ``nll_on_set``  : -E[log p(true | set)] with p normalized over
-                         the C candidates — crucially invariant to
-                         variance clamping (unlike ``m5_predictive_nll``)
-
-    Because the normalization is over a fixed-size discrete set, a
-    geometry cannot "cheat" by collapsing its continuous density; the
-    metric rewards only actual ranking quality.
+      - ``wm_mean_logvar``  : average log-variance on the sample
+      - ``wm_frac_at_floor``: fraction of dims within 0.1 of the floor
+      - ``wm_logvar_floor`` : the floor itself, for context
+      - ``wm_collapsed``    : boolean verdict (mean < floor + 0.5)
 
     Args:
-        world_model: module exposing ``log_prob_candidates(s, cands)``.
-        lagrangian: module callable as ``lagrangian(s_flat, c_flat)``.
-        s: (N, D) current states.
-        s_next: (N, D) true next states.
-        candidate_size: size C of the candidate set (default 32).
-        seed: seed used for candidate sampling (forked from the global
-            RNG so the call is reproducible without side effects).
+        world_model: module exposing a ``forward(s) -> (mean, logvar)``
+            signature and a ``min_logvar`` attribute.
+        s: (N, D) latent states to evaluate on.
 
     Returns:
-        dict with keys q_top1_acc, q_top5_acc, q_mean_rank,
-        q_nll_on_set, K_top1_acc, K_top5_acc, K_mean_rank, K_nll_on_set.
+        dict with the four keys above.
     """
-    from ..training.candidates import build_candidate_set_c1
+    with torch.no_grad():
+        _, logvar = world_model(s)
+        mean_logvar = logvar.mean().item()
+        frac_at_floor = (
+            logvar <= world_model.min_logvar + 0.1
+        ).float().mean().item()
 
-    # Deterministic candidate sampling, without polluting the global RNG.
-    with torch.random.fork_rng(devices=[s.device] if s.is_cuda else []):
-        torch.manual_seed(seed)
-        candidates, _true_idx = build_candidate_set_c1(
-            s, s_next, candidate_size=candidate_size
-        )
-    # By construction of C1, the true next is always at column 0.
+    return {
+        "wm_mean_logvar": mean_logvar,
+        "wm_frac_at_floor": frac_at_floor,
+        "wm_logvar_floor": float(world_model.min_logvar),
+        "wm_collapsed": mean_logvar < world_model.min_logvar + 0.5,
+    }
 
-    batch, n_cand, dim = candidates.shape
 
-    # ---- q_θ: world-model log-densities, normalized over the set ----
-    q_log_probs = world_model.log_prob_candidates(s, candidates).log_softmax(dim=-1)
+def m5_candidate_metrics(
+    world_model,
+    s: torch.Tensor,
+    candidates: torch.Tensor,
+    true_idx: torch.Tensor,
+    topk: int = 5,
+) -> dict:
+    """
+    Discrete predictive metrics on a pre-built candidate set.
 
-    # ---- K_θ: Gibbs kernel from the Lagrangian, normalized over the set ----
-    s_flat = s.unsqueeze(1).expand(-1, n_cand, -1).reshape(-1, dim)
-    c_flat = candidates.reshape(-1, dim)
-    K_logits = (-lagrangian(s_flat, c_flat)).reshape(batch, n_cand)
-    K_log_probs = K_logits.log_softmax(dim=-1)
+    Uses ONLY the world model q_θ (not the Gibbs kernel K_θ), because:
 
-    def _stats(log_probs: torch.Tensor) -> dict:
-        """Compute top-k / mean-rank / nll stats assuming true at col 0."""
-        n_top = min(5, log_probs.shape[-1])
-        top1 = (log_probs.argmax(dim=-1) == 0).float().mean().item()
-        top5_idx = log_probs.topk(n_top, dim=-1).indices
-        top5 = (top5_idx == 0).any(dim=-1).float().mean().item()
-        lp0 = log_probs[:, :1]
-        # Optimistic rank: count strictly greater entries (ties with the
-        # true candidate do not penalize).
-        rank = (log_probs > lp0).sum(dim=-1).float() + 1.0
-        mean_rank = rank.mean().item()
-        nll = -log_probs[:, 0].mean().item()
-        return {
-            "top1_acc": top1,
-            "top5_acc": top5,
-            "mean_rank": mean_rank,
-            "nll_on_set": nll,
-        }
+      1. q_θ is the object the paper claims as the extracted world model.
+      2. K_θ includes the Lagrangian's geometric term, so using it as a
+         discrete scoring function would bias the comparison toward the
+         Lorentzian geometry (it "judges itself").
 
-    q_stats = _stats(q_log_probs)
-    K_stats = _stats(K_log_probs)
+    Reports four standard next-item metrics on the candidate set:
 
-    out = {f"q_{k}": v for k, v in q_stats.items()}
-    out.update({f"K_{k}": v for k, v in K_stats.items()})
-    return out
+      - ``m5d_ce``   : cross-entropy (NLL of the true class under the
+                      set-normalised softmax of log q)
+      - ``m5d_top1`` : fraction of rows where argmax == true_idx
+      - ``m5d_topk`` : fraction of rows where true_idx is in the top k
+      - ``m5d_mrr``  : mean reciprocal rank of the true candidate
+      - ``m5d_topk_k``: effective k used (min(topk, C))
+
+    Ties in log q are resolved by ``argsort`` stably, so the reported
+    rank is deterministic given the same inputs.
+
+    Args:
+        world_model: module exposing ``log_prob(s, s_next)``.
+        s: (B, D) current states.
+        candidates: (B, C, D) candidate next states.
+        true_idx: (B,) long tensor; index of the true next state within
+            each candidate set (0 for C1-built sets).
+        topk: k for top-k recall (default 5).
+
+    Returns:
+        dict with the five keys listed above.
+    """
+    import torch.nn.functional as F
+
+    batch, C, D = candidates.shape
+    s_exp = s.unsqueeze(1).expand(-1, C, -1).reshape(-1, D)
+    c_flat = candidates.reshape(-1, D)
+
+    log_q = world_model.log_prob(s_exp, c_flat).reshape(batch, C)
+    log_q_norm = F.log_softmax(log_q, dim=-1)
+
+    # Cross-entropy on the true candidate
+    ce = F.nll_loss(log_q_norm, true_idx.long()).item()
+
+    # Ranks (1-based; ties broken by index position via argsort)
+    order = torch.argsort(log_q, dim=-1, descending=True)
+    true_idx_exp = true_idx.long().unsqueeze(1)
+    rank = (order == true_idx_exp).float().argmax(dim=-1) + 1  # (B,)
+
+    top1 = (rank == 1).float().mean().item()
+    topk_eff = min(topk, C)
+    topk_recall = (rank <= topk_eff).float().mean().item()
+    mrr = (1.0 / rank.float()).mean().item()
+
+    return {
+        "m5d_ce": ce,
+        "m5d_top1": top1,
+        "m5d_topk": topk_recall,
+        "m5d_mrr": mrr,
+        "m5d_topk_k": topk_eff,
+    }
 
 
 def m6_branching_signal(
@@ -535,28 +669,43 @@ def compute_all_metrics(
     reversed_trajectories: Optional[list] = None,
     branch_data: Optional[dict] = None,
     base_rate: Optional[float] = None,
+    semantic_costs: Optional[torch.Tensor] = None,
 ) -> Dict[str, float]:
     """
     Compute all applicable metrics given the available data.
 
     Args:
-        base_rate: shared "reachable" fraction for m4_fair across geometries.
-            Pass None for the reference geometry (typically Lorentzian) to
-            auto-calibrate from its intervals; pass that same value to the
-            baselines for a fair comparison. See m4_fair for details.
+        base_rate: shared "reachable" fraction for m4_fair_candidates across
+            geometries. Pass None for the reference geometry (typically
+            Lorentzian) to auto-calibrate from its candidate set; pass that
+            same value to the baselines for a fair comparison.
+        semantic_costs: optional (n_ev, C) per-candidate semantic costs from
+            the trained semantic surrogate. When provided, the plausibility
+            set in m4_fair_candidates is defined without the geometric term.
 
-    Returns a dict of metric_name -> value. M4 is reported twice:
-      - m4raw_*  : raw cone alignment (tautologically zero for
-                   Euclidean/Riemannian where squared_interval ≥ 0)
-      - m4fair_* : geometry-agnostic version with a shared base_rate
+    Returns a dict of metric_name -> value. Includes:
+      - m1_timelike_rate
+      - m5_nll              (continuous diagnostic; unreliable under clamp)
+      - wm_mean_logvar / wm_frac_at_floor / wm_logvar_floor / wm_collapsed
+        (variance-collapse diagnostic for m5_nll)
+      - m2_*   (only when forward/reversed trajectories are supplied)
+      - m4raw_*  (cone alignment — tautological for non-Lorentzian)
+      - m4fair_* (candidate-set fair M4, back-compat prefix)
+      - m5d_*  (discrete predictive metrics via world-model ranking)
+      - m3_*   (only when branch_data is supplied)
     """
     results = {}
 
     # M1: Time-likeness rate (always available)
     results["m1_timelike_rate"] = m1_timelike_rate(metric, s, s_next)
 
-    # M5: Predictive NLL (always available)
+    # M5 continuous (kept as a diagnostic; may be dominated by variance clamp)
     results["m5_nll"] = m5_predictive_nll(world_model, s, s_next)
+
+    # Variance-collapse diagnostic for M5 continuous.
+    # Without this, a collapsed Gaussian can report spuriously low NLL.
+    n_diag = min(512, s.shape[0])
+    results.update(world_model_variance_diagnostic(world_model, s[:n_diag]))
 
     # M2: Time-reversal gap (needs forward + reversed trajectories)
     if forward_trajectories and reversed_trajectories:
@@ -566,36 +715,37 @@ def compute_all_metrics(
         )
         results.update({f"m2_{k}": v for k, v in m2.items()})
 
-    # M4: Cone alignment (needs candidate sets)
+    # M4 + M5-discrete (need a candidate set)
     if s.shape[0] >= 16:
         from ..training.candidates import build_candidate_set_c1
         n_ev = min(256, s.shape[0])
-        cands_m4, _ = build_candidate_set_c1(
+        cands_m4, true_idx = build_candidate_set_c1(
             s[:n_ev], s_next[:n_ev], candidate_size=32
         )
+
         # ---- M4 raw: diagnostic only (tautological for non-Lorentzian) ----
         m4 = m4_cone_alignment(metric, lagrangian, s[:n_ev], cands_m4)
         results.update({f"m4raw_{k}": v for k, v in m4.items()})
 
-        # ---- M4 fair: geometry-agnostic with shared base_rate ----
-        perm = torch.randperm(n_ev, device=s.device)
-        m4f = m4_fair(
-            metric,
-            s[:n_ev],
-            s_next[:n_ev],
-            s_next[:n_ev][perm],
-            geometry=metric.geometry,
+        # ---- M4 fair on the candidate set (supersedes shuffled-neg m4_fair) ----
+        geometry = getattr(metric, "geometry", "lorentzian")
+        m4f = m4_fair_candidates(
+            metric, lagrangian,
+            s[:n_ev], cands_m4,
+            geometry=geometry,
             base_rate=base_rate,
+            semantic_costs=semantic_costs,
         )
-        # Rename m4f_* -> m4fair_* as requested by the evaluation protocol
+        # Back-compat: keep the m4fair_* output prefix.
         results.update(
             {f"m4fair_{k[len('m4f_'):]}": v for k, v in m4f.items()}
         )
 
-        # ---- M5 discrete: candidate-set ranking, variance-clamp invariant ----
-        # The thesis metric for the world model / Gibbs kernel quality.
-        m5d = m5_discrete_rank(world_model, lagrangian, s[:n_ev], s_next[:n_ev])
-        results.update({f"m5disc_{k}": v for k, v in m5d.items()})
+        # ---- M5 discrete: clamp-invariant world-model ranking ----
+        m5d = m5_candidate_metrics(
+            world_model, s[:n_ev], cands_m4, true_idx, topk=5,
+        )
+        results.update(m5d)
 
     # M3: Branching separation (needs branch data)
     if branch_data:

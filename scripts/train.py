@@ -338,7 +338,15 @@ def run_d2(cfg):
     from src.data.preprocessing import preprocess_trajectory_dataset
     from src.training.trainer import WorldModelTrainer
     from src.evaluation.metrics import (
-        m1_timelike_rate, m5_predictive_nll, m5_discrete_rank,
+        m1_timelike_rate,
+        m5_predictive_nll,
+        m4_cone_alignment,
+        m4_fair_candidates,
+        m5_candidate_metrics,
+        world_model_variance_diagnostic,
+    )
+    from src.training.candidates import (
+        build_candidate_set_c1, build_candidate_set_c2,
     )
 
     print("\n" + "=" * 60)
@@ -446,96 +454,127 @@ def run_d2(cfg):
         m1 = m1_timelike_rate(trainer.metric, es_lat, esn_lat)
         m5 = m5_predictive_nll(trainer.world_model, es_lat, esn_lat)
 
-        # Eval subset size shared between M4 and M5 discrete
-        n_ev = min(256, len(es_lat))
+        # --- Variance-collapse diagnostic ---
+        # Flag when M5 continuous is dominated by the logvar clamp.
+        n_diag = min(512, len(es_lat))
+        wm_diag = world_model_variance_diagnostic(trainer.world_model, es_lat[:n_diag])
 
-        # M5 discrete: candidate-set ranking — the thesis-aligned version
-        # of M5, invariant to the continuous world model's variance clamp.
-        m5d = m5_discrete_rank(
-            trainer.world_model, trainer.lagrangian,
-            es_lat[:n_ev], esn_lat[:n_ev],
+        # --- Build candidate set (same strategy as training if C2 active) ---
+        n_ev = min(256, len(es_lat))
+        cand_size = cfg.candidate_set_size
+        if cfg.candidate_strategy in ("c1c2", "c1c2c3"):
+            cands, true_idx = build_candidate_set_c2(
+                es_lat[:n_ev], esn_lat[:n_ev],
+                all_states=es_lat,
+                candidate_size=cand_size,
+                n_knn=min(16, cand_size - 1),
+                knn_index=None,
+            )
+        else:
+            cands, true_idx = build_candidate_set_c1(
+                es_lat[:n_ev], esn_lat[:n_ev], cand_size,
+            )
+
+        # --- Semantic costs from the trained surrogate, if active ---
+        # Using these decouples the plausibility set from the Lagrangian's
+        # geometric term ("Lagrangian judges itself" avoidance).
+        semantic_costs = None
+        if getattr(trainer.lagrangian, "use_semantic_surrogate", False):
+            D_lat = cands.shape[-1]
+            s_exp_eval = es_lat[:n_ev].unsqueeze(1).expand_as(cands)
+            sem_flat = trainer.lagrangian.semantic_term(
+                s_exp_eval.reshape(-1, D_lat),
+                cands.reshape(-1, D_lat),
+                precomputed_lsem=None,
+            )
+            semantic_costs = sem_flat.reshape(n_ev, cand_size)
+
+        # --- M4 raw cone alignment (diagnostic) ---
+        m4_raw = m4_cone_alignment(
+            trainer.metric, trainer.lagrangian,
+            es_lat[:n_ev], cands,
         )
 
-        # ---- M4 raw cone alignment on held-out articles ----
-        # Tautological for Euclidean/Riemannian where squared_interval ≥ 0,
-        # but kept as a diagnostic for the Lorentzian case.
-        from src.training.candidates import build_candidate_set_c1
-        from src.evaluation.metrics import m4_cone_alignment, m4_fair
-        cands, _ = build_candidate_set_c1(es_lat[:n_ev], esn_lat[:n_ev], 32)
-        m4 = m4_cone_alignment(trainer.metric, trainer.lagrangian,
-                               es_lat[:n_ev], cands)
+        # --- M4 fair with shared base_rate coupling across geometries ---
+        base_rate = None
+        lorentz_ref_path = os.path.join(cfg.output_dir, "d2_base_rate.json")
+        if cfg.geometry != "lorentzian" and os.path.exists(lorentz_ref_path):
+            with open(lorentz_ref_path) as f:
+                base_rate = json.load(f).get("base_rate")
 
-        # ---- M4 fair with shared base_rate across geometries ----
-        # Protocol: Lorentzian runs first and self-calibrates its base_rate,
-        # which is persisted to disk; Riemannian/Euclidean load and reuse it
-        # so all three classify the same FRACTION of pairs as "reachable",
-        # making M4 differences reflect directional structure (cone vs ball)
-        # rather than threshold tuning.
-        base_rate_path = Path(cfg.output_dir) / "d2_base_rate.json"
-        perm = torch.randperm(n_ev, device=es_lat.device)
-        s_neg_eval = esn_lat[:n_ev][perm]
+        m4_fair_r = m4_fair_candidates(
+            trainer.metric, trainer.lagrangian,
+            es_lat[:n_ev], cands,
+            geometry=cfg.geometry,
+            p=0.8,
+            base_rate=base_rate,
+            semantic_costs=semantic_costs,
+        )
 
+        # Lorentzian persists its auto-calibrated base_rate for the
+        # baselines to reuse. Run order enforced in scripts/run_baselines.py.
+        os.makedirs(cfg.output_dir, exist_ok=True)
         if cfg.geometry == "lorentzian":
-            m4f = m4_fair(
-                trainer.metric, es_lat[:n_ev], esn_lat[:n_ev], s_neg_eval,
-                geometry="lorentzian", base_rate=None,
-            )
-            os.makedirs(cfg.output_dir, exist_ok=True)
-            with open(base_rate_path, "w") as f:
-                json.dump({"base_rate": m4f["m4f_base_rate"]}, f, indent=2)
+            with open(lorentz_ref_path, "w") as f:
+                json.dump({"base_rate": m4_fair_r["m4f_base_rate"]}, f, indent=2)
             print(f"  [M4-fair] Lorentzian auto-calibrated base_rate="
-                  f"{m4f['m4f_base_rate']:.4f} → saved to {base_rate_path}")
+                  f"{m4_fair_r['m4f_base_rate']:.4f} → saved to {lorentz_ref_path}")
+        elif base_rate is not None:
+            print(f"  [M4-fair] Loaded Lorentzian base_rate="
+                  f"{base_rate:.4f} for fair comparison")
         else:
-            if base_rate_path.exists():
-                with open(base_rate_path) as f:
-                    shared_rate = json.load(f)["base_rate"]
-                print(f"  [M4-fair] Loaded Lorentzian base_rate="
-                      f"{shared_rate:.4f} for fair comparison")
-            else:
-                print(f"  [M4-fair] [WARN] {base_rate_path} not found. "
-                      f"Run Lorentzian first for fair comparison. "
-                      f"Falling back to base_rate=0.5.")
-                shared_rate = 0.5
-            m4f = m4_fair(
-                trainer.metric, es_lat[:n_ev], esn_lat[:n_ev], s_neg_eval,
-                geometry=cfg.geometry, base_rate=shared_rate,
-            )
+            print(f"  [M4-fair] [WARN] {lorentz_ref_path} not found — "
+                  f"Lorentzian must run first for a fair comparison. "
+                  f"Falling back to uncalibrated run (base_rate=0.5).")
+
+        # --- M5 discrete: candidate-set predictive metrics (world-model only) ---
+        m5_disc = m5_candidate_metrics(
+            trainer.world_model, es_lat[:n_ev], cands, true_idx, topk=5,
+        )
+
+    # ---- Variance-collapse print block ----
+    print(f"\n[VARIANCE DIAGNOSTIC]")
+    print(f"  mean logvar = {wm_diag['wm_mean_logvar']:.3f} "
+          f"(floor = {wm_diag['wm_logvar_floor']})")
+    print(f"  fraction of dims at floor (within 0.1): "
+          f"{wm_diag['wm_frac_at_floor']:.3f}")
+    if wm_diag["wm_collapsed"]:
+        print(f"  ⚠️  WORLD MODEL VARIANCE COLLAPSED — M5 continuous NLL is "
+              f"not meaningful for this run. Use M5 discrete (m5d_*) instead.")
 
     print(f"\n--- D2 Results ({cfg.geometry}) ---")
-    print(f"M1 (time-likeness rate):             {m1:.4f}")
-    print(f"M4 raw (cone Jaccard):               {m4['jaccard']:.4f}  [diagnostic]")
-    print(f"M4 raw (cone precision):             {m4['precision']:.4f}")
-    print(f"M4 raw (cone recall):                {m4['recall']:.4f}")
-    print(f"M4 fair (Jaccard):                   {m4f['m4f_jaccard']:.4f}  "
-          f"[base_rate={m4f['m4f_base_rate']:.4f}]")
-    print(f"M4 fair (precision):                 {m4f['m4f_precision']:.4f}")
-    print(f"M4 fair (recall):                    {m4f['m4f_recall']:.4f}")
-    print(f"M5 (continuous NLL, diagnostic only): {m5:.4f}")
-    print(f"M5 top-1 acc (world model):   {m5d['q_top1_acc']:.4f}")
-    print(f"M5 top-5 acc (world model):   {m5d['q_top5_acc']:.4f}")
-    print(f"M5 top-1 acc (Gibbs kernel):  {m5d['K_top1_acc']:.4f}")
-    print(f"M5 top-5 acc (Gibbs kernel):  {m5d['K_top5_acc']:.4f}")
-    print(f"M5 mean rank   (q / K):       {m5d['q_mean_rank']:.2f} / {m5d['K_mean_rank']:.2f}")
-    print(f"M5 nll-on-set  (q / K):       {m5d['q_nll_on_set']:.4f} / {m5d['K_nll_on_set']:.4f}")
+    print(f"M1 (time-likeness rate):              {m1:.4f}")
+    print(f"M4 raw (cone Jaccard):                {m4_raw['jaccard']:.4f}  [diagnostic]")
+    print(f"M4 raw (cone precision):              {m4_raw['precision']:.4f}")
+    print(f"M4 raw (cone recall):                 {m4_raw['recall']:.4f}")
+    print(f"M4 fair (Jaccard):                    {m4_fair_r['m4f_jaccard']:.4f}  "
+          f"[base_rate={m4_fair_r['m4f_base_rate']:.4f}]")
+    print(f"M4 fair (precision):                  {m4_fair_r['m4f_precision']:.4f}")
+    print(f"M4 fair (recall):                     {m4_fair_r['m4f_recall']:.4f}")
+    print(f"M5 (continuous NLL, diagnostic):      {m5:.4f}")
+    print(f"M5 discrete CE:                       {m5_disc['m5d_ce']:.4f}")
+    print(f"M5 discrete top-1:                    {m5_disc['m5d_top1']:.4f}")
+    print(f"M5 discrete top-{m5_disc['m5d_topk_k']}:                    "
+          f"{m5_disc['m5d_topk']:.4f}")
+    print(f"M5 discrete MRR:                      {m5_disc['m5d_mrr']:.4f}")
 
     # Save
-    os.makedirs(cfg.output_dir, exist_ok=True)
     results = {
         "m1": m1,
-        "m4raw_jaccard": m4["jaccard"],
-        "m4raw_precision": m4["precision"],
-        "m4raw_recall": m4["recall"],
-        "m4fair_jaccard": m4f["m4f_jaccard"],
-        "m4fair_precision": m4f["m4f_precision"],
-        "m4fair_recall": m4f["m4f_recall"],
-        "m4fair_base_rate": m4f["m4f_base_rate"],
         "m5": m5,
         "geometry": cfg.geometry,
         "has_semantic": has_lm,
         "eval_on_held_out_articles": True,
     }
-    # M5 discrete (candidate-set ranking) — thesis metric
-    results.update({f"m5disc_{k}": v for k, v in m5d.items()})
+    # Variance-collapse diagnostic (keys: wm_mean_logvar, wm_frac_at_floor,
+    # wm_logvar_floor, wm_collapsed)
+    results.update(wm_diag)
+    # M4 raw (diagnostic only)
+    results.update({f"m4raw_{k}": v for k, v in m4_raw.items()})
+    # M4 fair on the candidate set (thesis metric) — native m4f_* keys
+    results.update(m4_fair_r)
+    # M5 discrete predictive metrics (thesis metric)
+    results.update(m5_disc)
 
     # --- Coherence probe (extrinsic test) ---
     # Linear probe on [s_t ; s_{t+1}] pairs. Compares the geometrically
