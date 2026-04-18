@@ -1,0 +1,45 @@
+# Smoke test variant of configs/probe.yaml — tiny dataset, fast run.
+# Useful to validate the whole pipeline end-to-end before the overnight run.
+
+model_name: meta-llama/Meta-Llama-3-8B
+dtype: float16
+device: cuda
+
+probe_layer: 20
+
+window_size: 32
+window_stride: 16
+
+wiki_dataset: wikimedia/wikipedia
+wiki_config: 20231101.en
+wiki_min_tokens: 800
+wiki_max_tokens: 4000
+corpus_seed: 42
+corpus_prefilter_word_min: 150
+corpus_tokenize_candidates: 2000         # smaller candidate pool for speed
+
+prompt_tokens: 128
+continuation_tokens: 512
+temperature: 0.7
+top_p: 0.9
+k_trajectories: 2                        # 2 instead of 8
+gen_seed_base: 1000
+
+n_articles_forward: 5
+n_articles_branching: 3
+n_pairs_per_article: 1
+entropy_threshold: 3.0
+branching_window_start: 50
+branching_window_end: 100
+
+n_articles_reversed: 5
+reversed_passage_tokens: 640
+
+n_articles_validation: 3
+
+output_dir: ./data/llm_probe
+shard_size: 10                           # match the smaller dataset sizes
+save_dtype: float16
+
+gen_batch_size: 2
+log_every_n_articles: 1

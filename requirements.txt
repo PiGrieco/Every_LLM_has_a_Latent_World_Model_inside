@@ -4,11 +4,16 @@ numpy>=1.24.0
 scipy>=1.11.0
 
 # Encoders and LMs
-transformers>=4.36.0
+# transformers pinned to 4.44.2: 4.45+ regressed generate() with
+# num_return_sequences + DynamicCache on Llama-3 (v2 LLM probing relies on it).
+transformers==4.44.2
+accelerate>=0.33,<1.0
 sentence-transformers>=2.2.0
+safetensors>=0.4
+sentencepiece>=0.2
 
 # Data
-datasets>=2.16.0    # HuggingFace datasets for WikiText-103
+datasets>=2.20,<3.0
 
 # Nearest neighbors
 faiss-cpu>=1.7.4    # Use faiss-gpu if available; faiss-cpu works everywhere

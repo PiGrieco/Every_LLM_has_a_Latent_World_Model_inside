@@ -3,9 +3,28 @@
 ### A Lorentzian Geometric Framework for Making It Explicit
 
 [![Paper](https://img.shields.io/badge/Paper-PDF-red)](https://github.com/PiGrieco/Every_LLM_has_a_Latent_World_Model_inside)
-[![Python 3.9+](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://www.python.org/)
 [![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-orange.svg)](https://pytorch.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+
+## Status
+
+This repository is undergoing a **v2 redesign** (see paper).
+
+- **v1 (embedding-based)**: tagged at `v1-final`. The pipeline trained a
+  Lorentzian metric on MiniLM sentence embeddings over D0/D1/D2 (including
+  WikiText-103). Check out the tag to reproduce the v1 results exactly:
+  `git checkout v1-final && pip install -r requirements.txt`.
+- **v2 (LLM-native)**: in progress, milestones M1–M6. **M1 is live**:
+  extract per-layer hidden-state trajectories from Llama-3-8B on Wikipedia
+  (forward / branching / reversed datasets). See
+  [`src/llm_probe/README.md`](src/llm_probe/README.md) for the module and
+  [`configs/probe.yaml`](configs/probe.yaml) for the canonical run.
+  Subsequent milestones will progressively retire the v1
+  `src/{models,training,evaluation}` code in favour of the LLM-native stack.
+
+The sections below still describe v1. They will be updated as the v2
+stack lands.
 
 > **Piermatteo Grieco** (April 2026)
 >
