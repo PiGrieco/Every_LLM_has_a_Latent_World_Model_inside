@@ -1,15 +1,18 @@
 # Full probe run — Llama-3-8B on 1×H100.
 # See src/llm_probe/config.py for documentation of every field.
-# Expected wall time: ~24-30h on H100; expected disk: ~15 GB.
+# Expected wall time: 1.5-3 days on H100 (revised from the original
+# 24-30h estimate; the double forward pass — generate() then hooked
+# re-forward — effectively doubles compute). Expected disk: ~15 GB.
 
 # -- Model --
 model_name: meta-llama/Meta-Llama-3-8B
-# hf_token: null            # set to a string, or leave null to use $HF_TOKEN
+model_revision: main          # pin to a commit sha for exact reproducibility
+# hf_token: null              # set to a string, or leave unset to use $HF_TOKEN
 dtype: float16
 device: cuda
 
 # -- Layer probing --
-probe_layer: 20             # 0-indexed; Llama-3-8B has 32 layers
+probe_layer: 20               # 0-indexed; Llama-3-8B has 32 layers
 
 # -- Window pooling --
 window_size: 32
@@ -23,6 +26,7 @@ wiki_max_tokens: 4000
 corpus_seed: 42
 corpus_prefilter_word_min: 150
 corpus_tokenize_candidates: 100000
+narrative_preference_weight: 2.0      # (reserved for future multi-dataset weighting)
 
 # -- Generation --
 prompt_tokens: 128
@@ -41,6 +45,7 @@ n_pairs_per_article: 3
 entropy_threshold: 3.0
 branching_window_start: 50
 branching_window_end: 100
+branching_narrative_weight: 3.0       # Prefer narrative articles for branching
 
 # -- Dataset C: reversed --
 n_articles_reversed: 5000
@@ -57,3 +62,11 @@ save_dtype: float16
 # -- Runtime --
 gen_batch_size: 8
 log_every_n_articles: 50
+
+# -- Smoke-gate thresholds (rigid; scripts/probe/smoke_gate.py exits non-zero on failure) --
+gate_min_fraction_finite: 1.0
+gate_norm_min: 1.0
+gate_norm_max: 200.0
+gate_min_n_windows_median: 10.0
+gate_min_branching_divergence_fraction: 0.7
+gate_max_reversed_cosine_similarity: 0.95

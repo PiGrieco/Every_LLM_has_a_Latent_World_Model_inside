@@ -20,6 +20,18 @@ from .config import ProbeConfig
 logger = logging.getLogger(__name__)
 
 
+def _gen_config_dict(cfg: ProbeConfig, seed_used: int, num_return_sequences: int) -> dict:
+    """Effective generation params recorded into every trajectory item."""
+    return {
+        "temperature": cfg.temperature,
+        "top_p": cfg.top_p,
+        "seed_used": int(seed_used),
+        "num_return_sequences": int(num_return_sequences),
+        "max_new_tokens": cfg.continuation_tokens,
+        "prompt_tokens": cfg.prompt_tokens,
+    }
+
+
 def _prompt_ids(article: dict, tokenizer, cfg: ProbeConfig, device) -> torch.Tensor:
     """Encode an article into the first ``cfg.prompt_tokens`` tokens."""
     enc = tokenizer(
@@ -72,7 +84,8 @@ def generate_forward_trajectories(
         device = next(model.parameters()).device
         prompt_ids = _prompt_ids(article, tokenizer, cfg, device)
 
-        torch.manual_seed(cfg.gen_seed_base + doc_idx)
+        seed_used = cfg.gen_seed_base + doc_idx
+        torch.manual_seed(seed_used)
         with torch.no_grad():
             out = model.generate(
                 input_ids=prompt_ids.unsqueeze(0),
@@ -86,6 +99,7 @@ def generate_forward_trajectories(
             )
 
         sequences = out.sequences  # (K, <= prompt + continuation)
+        gen_cfg = _gen_config_dict(cfg, seed_used, cfg.k_trajectories)
 
         results: List[dict] = []
         for k in range(sequences.shape[0]):
@@ -106,6 +120,7 @@ def generate_forward_trajectories(
                 "hidden_states": traj["hidden_states"],
                 "token_positions": traj["token_positions"],
                 "seq_len": traj["seq_len"],
+                "generation_config": gen_cfg,
             })
         if not results:
             logger.warning("Article %s produced no usable forward trajectories", article["doc_id"])
@@ -152,7 +167,8 @@ def generate_branching_pairs(
         for pair_idx in range(cfg.n_pairs_per_article):
             try:
                 # 1. Base trajectory.
-                torch.manual_seed(cfg.gen_seed_base + doc_idx + pair_idx * 100)
+                seed_base_traj = cfg.gen_seed_base + doc_idx + pair_idx * 100
+                torch.manual_seed(seed_base_traj)
                 with torch.no_grad():
                     gen = model.generate(
                         input_ids=prompt_ids.unsqueeze(0),
@@ -205,7 +221,8 @@ def generate_branching_pairs(
                 ])
                 target_total = prompt_ids.shape[0] + cfg.continuation_tokens
                 remaining = max(1, target_total - prefix_alt.shape[0])
-                torch.manual_seed(cfg.gen_seed_base + doc_idx + pair_idx * 100 + 77)
+                seed_alt = cfg.gen_seed_base + doc_idx + pair_idx * 100 + 77
+                torch.manual_seed(seed_alt)
                 with torch.no_grad():
                     gen_alt = model.generate(
                         input_ids=prefix_alt.unsqueeze(0),
@@ -245,6 +262,10 @@ def generate_branching_pairs(
                         "hidden_states": traj_b["hidden_states"],
                         "token_positions": traj_b["token_positions"],
                         "seq_len": traj_b["seq_len"],
+                    },
+                    "generation_config": {
+                        "base": _gen_config_dict(cfg, seed_base_traj, 1),
+                        "alt": _gen_config_dict(cfg, seed_alt, 1),
                     },
                 })
             except Exception as exc:
@@ -298,7 +319,8 @@ def extract_reversed_pair(
             )
             return None
 
-        torch.manual_seed(cfg.gen_seed_base + doc_idx + 999_999)
+        seed_rev = cfg.gen_seed_base + doc_idx + 999_999
+        torch.manual_seed(seed_rev)
         max_start = int(tokens.shape[0] - cfg.reversed_passage_tokens)
         start = int(torch.randint(0, max_start + 1, (1,)).item())
         slice_ids = tokens[start : start + cfg.reversed_passage_tokens]
@@ -317,6 +339,11 @@ def extract_reversed_pair(
             "reversed_positions": rev["token_positions"],
             "forward_seq_len": fwd["seq_len"],
             "reversed_seq_len": rev["seq_len"],
+            "generation_config": {
+                "seed_used": int(seed_rev),
+                "passage_tokens": int(cfg.reversed_passage_tokens),
+                "start_offset": int(start),
+            },
         }
     except Exception as exc:
         logger.warning(

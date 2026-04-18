@@ -26,6 +26,7 @@ sys.path.insert(
 )
 
 from src.llm_probe import (
+    ProbeConfig,
     TrajectoryShardReader,
     validate_branching_divergence,
     validate_reversed_differ,
@@ -53,6 +54,9 @@ def main() -> None:
     p.add_argument("--kind", type=str, default=None,
                    choices=["forward", "branching", "reversed"],
                    help="Override autodetection of dataset kind.")
+    p.add_argument("--show-metadata", action="store_true",
+                   help="Print environment + model_metadata + probe config "
+                        "from the manifest (useful for pinning reviews).")
     args = p.parse_args()
 
     manifest_path = Path(args.manifest)
@@ -77,14 +81,28 @@ def main() -> None:
     }
     print(json.dumps(header, indent=2))
 
+    if args.show_metadata:
+        print("\n=== reproducibility metadata ===")
+        print(json.dumps(reader.get_metadata(), indent=2, default=str))
+
+    # Validators accept a cfg for thresholds; reuse the snapshot stored
+    # alongside the manifest so inspect reports agree with the run that
+    # produced the dataset.
+    snapshot = reader.get_metadata().get("probe_config_snapshot") or {}
+    try:
+        cfg = ProbeConfig(**{k: v for k, v in snapshot.items()
+                              if k in ProbeConfig.__dataclass_fields__})
+    except TypeError:
+        cfg = ProbeConfig()
+
     kind = args.kind or _infer_kind(reader)
     print(f"\n=== validator: {kind} ===")
     if kind == "branching":
-        stats = validate_branching_divergence(reader)
+        stats = validate_branching_divergence(reader, cfg)
     elif kind == "reversed":
-        stats = validate_reversed_differ(reader)
+        stats = validate_reversed_differ(reader, cfg)
     else:
-        stats = validate_trajectory_statistics(reader)
+        stats = validate_trajectory_statistics(reader, cfg)
     print(json.dumps(stats, indent=2, default=str))
 
 

@@ -9,21 +9,38 @@
 
 ## Status
 
-This repository is undergoing a **v2 redesign** (see paper).
+This repository is undergoing a **v2 redesign**. The v1
+embedding-based framework is tagged at `v1-final`.
 
-- **v1 (embedding-based)**: tagged at `v1-final`. The pipeline trained a
-  Lorentzian metric on MiniLM sentence embeddings over D0/D1/D2 (including
-  WikiText-103). Check out the tag to reproduce the v1 results exactly:
-  `git checkout v1-final && pip install -r requirements.txt`.
-- **v2 (LLM-native)**: in progress, milestones M1–M6. **M1 is live**:
-  extract per-layer hidden-state trajectories from Llama-3-8B on Wikipedia
-  (forward / branching / reversed datasets). See
-  [`src/llm_probe/README.md`](src/llm_probe/README.md) for the module and
-  [`configs/probe.yaml`](configs/probe.yaml) for the canonical run.
-  Subsequent milestones will progressively retire the v1
-  `src/{models,training,evaluation}` code in favour of the LLM-native stack.
+```bash
+git checkout v1-final   # reproduce v1 results exactly
+git checkout main       # current v2 work
+```
 
-The sections below still describe v1. They will be updated as the v2
+Current milestone: **M1 — LLM probing infrastructure**. See
+[`src/llm_probe/README.md`](src/llm_probe/README.md).
+
+### v2 roadmap
+
+- [x] **M1** — LLM activation trajectories (Llama-3-8B, Wikipedia, fp16
+  shards, rigid smoke gate before proceeding).
+- [ ] **M2** — Projection Φ / Ψ with **retrieval-first** decoder
+  (nearest-neighbor in hidden-state memory). This proves the latent is
+  informative before we build a generative decoder.
+- [ ] **M3** — Lorentzian metric with timelike + spacelike signals.
+  **Suffix-decoder** here, not `LM_head(Ψ(s))` directly: pass `Ψ(s)`
+  through remaining layers ℓ+1…L and the final norm before LM_head.
+  The null-cone is a probe-only diagnostic, never a training target.
+- [ ] **M4** — Cone-respecting factorised dynamics (discrete forward
+  model with a Lorentzian prior).
+- [ ] **M5** — Multi-step rollout + geodesics. Rollout is the
+  central world-model test (à la Dreamer / Ha-Schmidhuber); geodesics
+  are a bonus interpretability win, not a prerequisite.
+- [ ] **M6** — Intervention, boosts, and narrative-corpus experiments
+  (likely TinyStories / BookCorpus for cleaner branching than
+  Wikipedia).
+
+The sections below still describe v1 and will be updated as the v2
 stack lands.
 
 > **Piermatteo Grieco** (April 2026)

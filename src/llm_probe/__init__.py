@@ -8,6 +8,11 @@ expected timing on an H100.
 """
 
 from .config import ProbeConfig
+from .reproducibility import (
+    capture_environment,
+    capture_model_metadata,
+    config_snapshot,
+)
 from .model_loader import (
     install_activation_hook,
     load_model,
@@ -22,6 +27,7 @@ from .trajectory_generator import (
 )
 from .storage import TrajectoryShardReader, TrajectoryShardWriter
 from .validation import (
+    run_smoke_gate,
     validate_branching_divergence,
     validate_reversed_differ,
     validate_trajectory_statistics,
@@ -29,6 +35,9 @@ from .validation import (
 
 __all__ = [
     "ProbeConfig",
+    "capture_environment",
+    "capture_model_metadata",
+    "config_snapshot",
     "load_model",
     "install_activation_hook",
     "validate_model_structure",
@@ -44,4 +53,5 @@ __all__ = [
     "validate_trajectory_statistics",
     "validate_branching_divergence",
     "validate_reversed_differ",
+    "run_smoke_gate",
 ]

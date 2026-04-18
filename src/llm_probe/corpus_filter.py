@@ -1,10 +1,12 @@
 """Build a Wikipedia article pool and partition it into the three datasets.
 
-Loads the streaming Wikipedia dump, applies cheap pre-filters on word
-count, tokenizes candidates to measure true token length, and samples
-a pool large enough to cover forward / branching / reversed needs.
-The pool is cached to disk as JSON so re-runs (and debugging) are
-instantaneous.
+Loads the streaming Wikipedia dump, applies cheap word-count pre-filters,
+tokenizes candidates to measure true token length, flags articles whose
+lead sentence looks "narrative" (biographies / events / processes), and
+caches the result. Downstream :func:`assign_articles_to_datasets`
+draws overlapping subsets for the three target datasets; branching
+uses a narrative-weighted sampling so we don't train the metric on
+definition stubs that structurally don't branch.
 """
 
 from __future__ import annotations
@@ -13,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import random
 from pathlib import Path
 from typing import Any, List
@@ -28,37 +31,48 @@ def _doc_id_for(title: str) -> str:
     return "wiki_" + hashlib.sha1(title.encode("utf-8")).hexdigest()[:16]
 
 
+def _compile_patterns(patterns: List[str]) -> List[re.Pattern]:
+    return [re.compile(p) for p in patterns]
+
+
+def _is_narrative(text: str, compiled: List[re.Pattern]) -> bool:
+    """Return True iff the first 200 chars match any narrative pattern."""
+    lead = text[:200].strip()
+    return any(p.search(lead) for p in compiled)
+
+
 def build_article_pool(cfg: ProbeConfig, tokenizer) -> List[dict]:
     """Build (or reload from cache) a pool of usable Wikipedia articles.
 
-    The pool is large enough to cover all three target datasets as
-    *overlapping* subsets (not a partition); downstream
-    :func:`assign_articles_to_datasets` draws from it.
+    The pool holds enough articles to cover all three target datasets
+    as *overlapping* subsets (not a partition).
 
     Args:
-        cfg: Runtime configuration. Uses ``wiki_*`` fields for the
-            source, ``corpus_*`` for pre-filtering and sampling,
+        cfg: Runtime configuration. Uses ``wiki_*`` fields for source,
+            ``corpus_*`` for pre-filtering and sampling,
+            ``narrative_patterns`` to flag narrative articles, and
             ``output_dir`` as the cache root.
-        tokenizer: HF tokenizer (Llama-3 or a stand-in for tests).
+        tokenizer: HF tokenizer (Llama-3 in production, any tokenizer
+            in tests).
 
     Returns:
-        List of dicts ``{doc_id, title, text, token_count}``.
-
-    Notes:
-        Caching key: ``{cfg.output_dir}/article_pool.json``. The cache
-        is rebuilt if it exists but is too small to cover the combined
-        dataset requirements; otherwise reused verbatim.
+        List of dicts with keys ``doc_id``, ``title``, ``text``,
+        ``token_count``, ``is_narrative``.
     """
     cache_path = Path(cfg.output_dir) / "article_pool.json"
     total_needed = max(
-        cfg.n_articles_forward
-        + cfg.n_articles_branching
-        + cfg.n_articles_reversed,
-        # Overlap-friendly: the union may be smaller than the sum, but we
-        # still want the cache to hold at least the largest dataset.
         cfg.n_articles_forward,
         cfg.n_articles_branching,
         cfg.n_articles_reversed,
+    )
+    # Combined target so one pool covers non-overlapping worst-case too.
+    target_pool_size = max(
+        total_needed,
+        # Enough headroom for union sampling when the three dataset sizes
+        # together exceed the individual max.
+        cfg.n_articles_forward
+        + cfg.n_articles_branching
+        + cfg.n_articles_reversed,
     )
 
     if cache_path.exists():
@@ -66,6 +80,16 @@ def build_article_pool(cfg: ProbeConfig, tokenizer) -> List[dict]:
             with open(cache_path) as f:
                 cached = json.load(f)
             if isinstance(cached, list) and len(cached) >= total_needed:
+                # If cache lacks is_narrative (pre-revision), recompute it.
+                if cached and "is_narrative" not in cached[0]:
+                    compiled = _compile_patterns(cfg.narrative_patterns)
+                    for art in cached:
+                        art["is_narrative"] = _is_narrative(art.get("text", ""), compiled)
+                    with open(cache_path, "w") as f:
+                        json.dump(cached, f)
+                    logger.info(
+                        "Backfilled is_narrative on %d cached articles", len(cached),
+                    )
                 logger.info(
                     "Loaded cached article pool (%d articles) from %s",
                     len(cached), cache_path,
@@ -81,12 +105,13 @@ def build_article_pool(cfg: ProbeConfig, tokenizer) -> List[dict]:
     # ---- Build fresh ----
     from datasets import load_dataset
 
+    compiled = _compile_patterns(cfg.narrative_patterns)
+
     logger.info("Loading Wikipedia (%s / %s) ...", cfg.wiki_dataset, cfg.wiki_config)
     ds = load_dataset(
         cfg.wiki_dataset, cfg.wiki_config, split="train", streaming=False,
     )
 
-    # Cheap pre-filter on raw text length (word count) before tokenization.
     logger.info(
         "Pre-filtering on word count >= %d ...", cfg.corpus_prefilter_word_min,
     )
@@ -104,8 +129,6 @@ def build_article_pool(cfg: ProbeConfig, tokenizer) -> List[dict]:
     take = min(cfg.corpus_tokenize_candidates, len(prefiltered_indices))
     prefiltered_indices = prefiltered_indices[:take]
 
-    # Tokenize in batches to measure the true token count; keep only those
-    # inside [wiki_min_tokens, wiki_max_tokens].
     pool: List[dict] = []
     batch_size = 32
     logger.info(
@@ -115,8 +138,6 @@ def build_article_pool(cfg: ProbeConfig, tokenizer) -> List[dict]:
     for b_start in tqdm(range(0, take, batch_size), desc="tokenize", unit="batch"):
         batch_rows = [ds[i] for i in prefiltered_indices[b_start:b_start + batch_size]]
         texts = [r["text"] for r in batch_rows]
-        # Fast counting: no truncation so we see the true length; add_special_tokens=False
-        # because Llama-3 adds BOS later during per-article generate().
         enc = tokenizer(
             texts,
             add_special_tokens=False,
@@ -133,26 +154,48 @@ def build_article_pool(cfg: ProbeConfig, tokenizer) -> List[dict]:
                     "title": title,
                     "text": text,
                     "token_count": tok_count,
+                    "is_narrative": _is_narrative(text, compiled),
                 })
-                if len(pool) >= total_needed:
+                if len(pool) >= target_pool_size:
                     break
-        if len(pool) >= total_needed:
+        if len(pool) >= target_pool_size:
             break
 
     if len(pool) < total_needed:
         logger.warning(
-            "Only found %d articles matching the length window (needed %d). "
-            "Consider widening [wiki_min_tokens, wiki_max_tokens] or raising "
-            "corpus_tokenize_candidates.",
-            len(pool), total_needed,
+            "Only found %d articles matching the length window (needed at least %d). "
+            "Widen [wiki_min_tokens, wiki_max_tokens] or raise "
+            "corpus_tokenize_candidates.", len(pool), total_needed,
         )
 
-    # Cache.
     os.makedirs(cfg.output_dir, exist_ok=True)
     with open(cache_path, "w") as f:
         json.dump(pool, f)
-    logger.info("Cached pool of %d articles to %s", len(pool), cache_path)
+    logger.info(
+        "Cached pool of %d articles to %s (%d narrative)",
+        len(pool), cache_path, sum(1 for a in pool if a.get("is_narrative")),
+    )
     return pool
+
+
+def _weighted_sample_without_replacement(
+    population: List[dict], weights: List[float], k: int, rng: random.Random,
+) -> List[dict]:
+    """Efraimidis–Spirakis weighted reservoir sampling without replacement."""
+    if k >= len(population):
+        return list(population)
+    # Key_i = u_i ** (1 / w_i); take top-k by key.
+    keyed = []
+    for item, w in zip(population, weights):
+        if w <= 0:
+            w = 1e-12
+        u = rng.random()
+        # Use log for stability: log(u) / w
+        import math
+        key = math.log(u) / w
+        keyed.append((key, item))
+    keyed.sort(key=lambda t: t[0], reverse=True)
+    return [item for _, item in keyed[:k]]
 
 
 def assign_articles_to_datasets(
@@ -160,35 +203,48 @@ def assign_articles_to_datasets(
 ) -> dict:
     """Split the pool into overlapping subsets for the three datasets.
 
-    The three subsets (forward / branching / reversed) are allowed to
-    share articles — they probe the SAME model on DIFFERENT kinds of
-    trajectories, so cross-use of articles is natural and, if anything,
-    strengthens the comparison. The split is deterministic in
-    ``cfg.corpus_seed``.
-
-    Args:
-        pool: Output of :func:`build_article_pool`.
-        cfg: Runtime configuration.
+    forward / reversed get uniform samples. branching gets a weighted
+    sample that favours ``is_narrative=True`` articles by
+    ``cfg.branching_narrative_weight``. Any single article may appear in
+    multiple datasets — the three measurements probe different
+    properties of the SAME LM on the SAME text, and cross-use is
+    natural.
 
     Returns:
         dict with keys ``"forward"``, ``"branching"``, ``"reversed"``,
-        ``"validation"`` mapping to lists of article dicts.
+        ``"validation"``.
     """
     rng = random.Random(cfg.corpus_seed)
 
-    def _sample(n: int) -> List[dict]:
+    def _uniform(n: int) -> List[dict]:
         if n >= len(pool):
             return list(pool)
         return rng.sample(pool, n)
 
-    forward = _sample(cfg.n_articles_forward)
-    branching = _sample(cfg.n_articles_branching)
-    reversed_ = _sample(cfg.n_articles_reversed)
-    validation = forward[: cfg.n_articles_validation]
+    def _narrative_weighted(n: int, weight: float) -> List[dict]:
+        if n >= len(pool):
+            return list(pool)
+        weights = [
+            weight if a.get("is_narrative") else 1.0 for a in pool
+        ]
+        return _weighted_sample_without_replacement(pool, weights, n, rng)
 
+    forward = _uniform(cfg.n_articles_forward)
+    branching = _narrative_weighted(
+        cfg.n_articles_branching, cfg.branching_narrative_weight,
+    )
+    reversed_ = _uniform(cfg.n_articles_reversed)
+    validation = sorted(
+        forward[: cfg.n_articles_validation],
+        key=lambda a: a.get("doc_id", ""),
+    )
+
+    n_narrative_branch = sum(1 for a in branching if a.get("is_narrative"))
     logger.info(
-        "Dataset sizes: forward=%d, branching=%d, reversed=%d, validation=%d",
-        len(forward), len(branching), len(reversed_), len(validation),
+        "Dataset sizes: forward=%d, branching=%d (%d narrative), "
+        "reversed=%d, validation=%d",
+        len(forward), len(branching), n_narrative_branch,
+        len(reversed_), len(validation),
     )
     return {
         "forward": forward,

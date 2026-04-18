@@ -37,6 +37,8 @@ from src.llm_probe import (
     TrajectoryShardWriter,
     assign_articles_to_datasets,
     build_article_pool,
+    capture_environment,
+    config_snapshot,
     extract_reversed_pair,
     generate_branching_pairs,
     generate_forward_trajectories,
@@ -134,9 +136,11 @@ def _print_plan(cfg: ProbeConfig, datasets_to_run: list[str]) -> None:
     print("\n=== PROBE RUN PLAN ===")
     print(json.dumps(plan, indent=2))
     print(
-        "\nTiming rule of thumb on one H100: ~5 s/article for forward, "
-        "~15 s/article for branching, ~1 s/article for reversed. "
-        "Adjust upwards if the prompt/continuation budget is large.\n"
+        "\nTiming rule of thumb on one H100 (revised M1 estimate):\n"
+        "  forward    ~30-50 h   (generate + re-forward per trajectory)\n"
+        "  branching  ~10-15 h   (2× generate + 2× re-forward per pair)\n"
+        "  reversed    ~5-8 h    (2× re-forward per article)\n"
+        "  TOTAL      1.5-3 days (dataset size + article length variance).\n"
     )
 
 
@@ -152,6 +156,7 @@ def _run_dataset(
     captured_list,
     resume: bool,
     failure_threshold: float,
+    metadata: dict,
 ) -> None:
     """Run a single dataset (forward / branching / reversed / validation).
 
@@ -162,6 +167,8 @@ def _run_dataset(
         dataset_dir=dataset_dir,
         shard_size=cfg.shard_size,
         save_dtype=cfg.save_dtype,
+        metadata=metadata,
+        dataset_name=name,
     ) as writer:
 
         existing = writer.existing_doc_ids() if resume else set()
@@ -225,17 +232,24 @@ def _run_dataset(
                     name, n_processed, len(articles), n_failed,
                 )
 
-    # Validation pass.
+    # Post-run validation (non-blocking here; the hard gate lives in
+    # scripts/probe/smoke_gate.py, which exits non-zero on failure).
     reader = TrajectoryShardReader(dataset_dir)
     if name in ("forward", "validation"):
         print(f"\n=== validate_trajectory_statistics ({name}) ===")
-        print(json.dumps(validate_trajectory_statistics(reader), indent=2, default=str))
+        print(json.dumps(
+            validate_trajectory_statistics(reader, cfg), indent=2, default=str,
+        ))
     elif name == "branching":
         print(f"\n=== validate_branching_divergence ({name}) ===")
-        print(json.dumps(validate_branching_divergence(reader), indent=2, default=str))
+        print(json.dumps(
+            validate_branching_divergence(reader, cfg), indent=2, default=str,
+        ))
     elif name == "reversed":
         print(f"\n=== validate_reversed_differ ({name}) ===")
-        print(json.dumps(validate_reversed_differ(reader), indent=2, default=str))
+        print(json.dumps(
+            validate_reversed_differ(reader, cfg), indent=2, default=str,
+        ))
 
 
 # ----------------------------------- main -----------------------------------
@@ -258,10 +272,21 @@ def main() -> None:
         _print_plan(cfg, datasets_to_run)
         return
 
+    # Capture environment upfront so a tokenizer-only failure still produces
+    # a diagnostic log that pins the exact transformers / datasets versions.
+    env = capture_environment()
+    logger.info("Environment snapshot: %s", env)
+
     # Model + hook (installed ONCE, shared across datasets).
     model, tokenizer, info = load_model(cfg)
     validate_model_structure(model, cfg)
     hook_handle, captured_list = install_activation_hook(model, cfg.probe_layer)
+
+    metadata = {
+        "environment": env,
+        "model_metadata": info,
+        "probe_config_snapshot": config_snapshot(cfg),
+    }
 
     try:
         pool = build_article_pool(cfg, tokenizer)
@@ -282,6 +307,7 @@ def main() -> None:
                 captured_list=captured_list,
                 resume=args.resume,
                 failure_threshold=args.failure_threshold,
+                metadata=metadata,
             )
     finally:
         hook_handle.remove()

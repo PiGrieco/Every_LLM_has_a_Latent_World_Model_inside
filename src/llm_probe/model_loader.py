@@ -16,6 +16,7 @@ import torch
 import torch.nn as nn
 
 from .config import ProbeConfig
+from .reproducibility import capture_model_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +46,10 @@ def load_model(
         cfg: Runtime configuration.
 
     Returns:
-        Tuple of ``(model, tokenizer, info)`` where ``info`` contains
-        keys ``n_layers``, ``d_model``, ``vocab_size``, ``model_name``.
+        Tuple ``(model, tokenizer, info)`` where ``info`` is the output
+        of :func:`~.reproducibility.capture_model_metadata` and includes
+        the model revision / commit sha, architecture dims, dtype, and
+        a redacted hash of the probe config.
 
     Raises:
         RuntimeError: If no Hugging Face token is available and the
@@ -65,14 +68,22 @@ def load_model(
     if dtype is None:
         raise ValueError(f"Unknown dtype {cfg.dtype!r}; expected one of {list(_DTYPE_MAP)}")
 
-    logger.info("Loading tokenizer %s", cfg.model_name)
-    tokenizer = AutoTokenizer.from_pretrained(cfg.model_name, token=token)
+    logger.info(
+        "Loading tokenizer %s @ revision=%s", cfg.model_name, cfg.model_revision,
+    )
+    tokenizer = AutoTokenizer.from_pretrained(
+        cfg.model_name, revision=cfg.model_revision, token=token,
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    logger.info("Loading model %s (dtype=%s) on %s", cfg.model_name, cfg.dtype, cfg.device)
+    logger.info(
+        "Loading model %s @ revision=%s (dtype=%s) on %s",
+        cfg.model_name, cfg.model_revision, cfg.dtype, cfg.device,
+    )
     model = AutoModelForCausalLM.from_pretrained(
         cfg.model_name,
+        revision=cfg.model_revision,
         torch_dtype=dtype,
         device_map={"": 0} if cfg.device == "cuda" else cfg.device,
         attn_implementation="sdpa",
@@ -80,12 +91,7 @@ def load_model(
     )
     model.eval()
 
-    info = {
-        "n_layers": model.config.num_hidden_layers,
-        "d_model": model.config.hidden_size,
-        "vocab_size": model.config.vocab_size,
-        "model_name": cfg.model_name,
-    }
+    info = capture_model_metadata(model, tokenizer, cfg)
     logger.info("Model loaded: %s", info)
     return model, tokenizer, info
 

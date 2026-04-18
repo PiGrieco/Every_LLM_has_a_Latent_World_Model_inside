@@ -14,7 +14,7 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Any, Iterator, List, Optional, Set
+from typing import Any, Iterator, List, Optional, Set  # noqa: F401
 
 import torch
 
@@ -51,12 +51,22 @@ class TrajectoryShardWriter:
 
     Usage::
 
-        with TrajectoryShardWriter(dir_path, shard_size=100, save_dtype="float16") as w:
+        metadata = {
+            "environment": capture_environment(),
+            "model_metadata": capture_model_metadata(model, tokenizer, cfg),
+            "probe_config_snapshot": config_snapshot(cfg),
+        }
+        with TrajectoryShardWriter(dir_path, shard_size=100,
+                                   save_dtype="float16",
+                                   metadata=metadata,
+                                   dataset_name="forward") as w:
             for item in items:
                 w.add(item)
 
     The context manager guarantees a final flush on exit. The manifest
-    ``manifest.json`` is rewritten atomically on every flush.
+    ``manifest.json`` is rewritten atomically on every flush and carries
+    the exact library versions, model commit sha, and probe config used
+    to produce the shards.
     """
 
     def __init__(
@@ -64,6 +74,8 @@ class TrajectoryShardWriter:
         dataset_dir: str,
         shard_size: int = 100,
         save_dtype: str = "float16",
+        metadata: Optional[dict] = None,
+        dataset_name: Optional[str] = None,
     ):
         self.dataset_dir = Path(dataset_dir)
         self.dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -71,6 +83,9 @@ class TrajectoryShardWriter:
         self.save_dtype_name = save_dtype
         self.save_dtype = _SAVE_DTYPE_MAP.get(save_dtype.lower(), torch.float16)
         self._buffer: List[dict] = []
+        self._metadata = dict(metadata) if metadata else {}
+        # Derive dataset_name from the dir unless explicitly given.
+        self._dataset_name = dataset_name or self.dataset_dir.name
 
         # Manifest state — reload if we're resuming an existing directory.
         self._manifest_path = self.dataset_dir / "manifest.json"
@@ -84,23 +99,37 @@ class TrajectoryShardWriter:
                     "Resuming writer at %s: %d existing shards, %d items",
                     self.dataset_dir, self._shard_idx, self._n_items_total,
                 )
+                # Refresh top-level metadata so the manifest always reflects
+                # the CURRENT run's env (which matters if someone upgrades
+                # transformers between resumptions — mismatches surface in
+                # reviews of manifest.json diffs).
+                self._merge_metadata()
             except Exception as exc:
                 logger.warning("Could not read existing manifest (%s); starting fresh", exc)
                 self._init_manifest()
         else:
             self._init_manifest()
 
+    def _merge_metadata(self) -> None:
+        """Update the manifest's metadata block, keeping created_at stable."""
+        for k, v in self._metadata.items():
+            self._manifest[k] = v
+        self._manifest.setdefault("dataset_name", self._dataset_name)
+
     def _init_manifest(self) -> None:
         self._shard_idx = 0
         self._n_items_total = 0
         self._manifest = {
             "dataset_dir": str(self.dataset_dir),
+            "dataset_name": self._dataset_name,
             "n_shards": 0,
             "n_items_total": 0,
             "shards": [],
             "save_dtype": self.save_dtype_name,
             "created_at": _dt.datetime.now(_dt.timezone.utc).isoformat(),
         }
+        # Fold caller-supplied reproducibility metadata in.
+        self._merge_metadata()
 
     # ---- context manager ----
     def __enter__(self) -> "TrajectoryShardWriter":
@@ -195,3 +224,14 @@ class TrajectoryShardReader:
     def get_doc_ids(self) -> Set[str]:
         """Union of doc_ids across all shards."""
         return set(d for s in self._manifest.get("shards", []) for d in s.get("doc_ids", []))
+
+    def get_metadata(self) -> dict:
+        """Return environment + model_metadata + probe_config_snapshot."""
+        m = self._manifest
+        return {
+            "environment": m.get("environment", {}),
+            "model_metadata": m.get("model_metadata", {}),
+            "probe_config_snapshot": m.get("probe_config_snapshot", {}),
+            "dataset_name": m.get("dataset_name", ""),
+            "created_at": m.get("created_at", ""),
+        }

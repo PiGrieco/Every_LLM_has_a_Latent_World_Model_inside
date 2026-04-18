@@ -1,7 +1,9 @@
-# Smoke test variant of configs/probe.yaml — tiny dataset, fast run.
-# Useful to validate the whole pipeline end-to-end before the overnight run.
+# Smoke-test variant of configs/probe.yaml — tiny dataset, fast run.
+# Used by scripts/probe/smoke_gate.py as the go/no-go checkpoint
+# before the overnight full run.
 
 model_name: meta-llama/Meta-Llama-3-8B
+model_revision: main
 dtype: float16
 device: cuda
 
@@ -16,13 +18,14 @@ wiki_min_tokens: 800
 wiki_max_tokens: 4000
 corpus_seed: 42
 corpus_prefilter_word_min: 150
-corpus_tokenize_candidates: 2000         # smaller candidate pool for speed
+corpus_tokenize_candidates: 2000
+narrative_preference_weight: 2.0
 
 prompt_tokens: 128
 continuation_tokens: 512
 temperature: 0.7
 top_p: 0.9
-k_trajectories: 2                        # 2 instead of 8
+k_trajectories: 2
 gen_seed_base: 1000
 
 n_articles_forward: 5
@@ -31,6 +34,7 @@ n_pairs_per_article: 1
 entropy_threshold: 3.0
 branching_window_start: 50
 branching_window_end: 100
+branching_narrative_weight: 3.0
 
 n_articles_reversed: 5
 reversed_passage_tokens: 640
@@ -38,8 +42,17 @@ reversed_passage_tokens: 640
 n_articles_validation: 3
 
 output_dir: ./data/llm_probe
-shard_size: 10                           # match the smaller dataset sizes
+shard_size: 10
 save_dtype: float16
 
 gen_batch_size: 2
 log_every_n_articles: 1
+
+# Smoke-gate thresholds identical to production; the smoke dataset
+# must clear the same bar before M2 is allowed to start.
+gate_min_fraction_finite: 1.0
+gate_norm_min: 1.0
+gate_norm_max: 200.0
+gate_min_n_windows_median: 10.0
+gate_min_branching_divergence_fraction: 0.7
+gate_max_reversed_cosine_similarity: 0.95
