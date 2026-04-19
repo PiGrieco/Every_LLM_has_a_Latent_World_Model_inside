@@ -1,0 +1,63 @@
+# Smoke variant of configs/projection.yaml — 20-min target on H100.
+
+probe_data_dir: ./data/llm_probe
+forward_dataset: forward
+branching_dataset: branching
+
+latent_dim: 32
+auto_adjust_dim: false            # smoke skips the PCA estimate step
+intrinsic_dim_target_variance: 0.99
+intrinsic_dim_min: 16
+intrinsic_dim_max: 128
+intrinsic_dim_json: ./outputs/projection/intrinsic_dim.json
+
+encoder_hidden: 128
+encoder_skip_proj: true
+encoder_dropout: 0.0
+decoder_hidden: 128
+decoder_dropout: 0.0
+
+use_adversarial: false
+discriminator_hidden: 64
+discriminator_layers: 4
+discriminator_dropout: 0.1
+
+stage_a_epochs: 2
+stage_a_lr: 0.0003
+stage_b_epochs: 2
+stage_b_lr: 0.0001
+lambda_consistency: 0.5
+stage_c_epochs: 2
+stage_c_lr_g: 0.00005
+stage_c_lr_d: 0.0002
+lambda_adversarial: 0.1
+discriminator_steps_per_g: 2
+discriminator_gp_weight: 10.0
+
+batch_size: 64
+num_workers: 0
+train_split_fraction: 0.9
+random_seed: 42
+
+retrieval_memory_size: 500
+retrieval_queries: 100
+retrieval_topk: [1, 5, 10]
+memory_query_split_fraction: 0.6
+
+identity_probe_n_classes: 50
+identity_probe_samples_per_class: 3
+identity_probe_epochs: 3
+
+# Softer gate thresholds for a smoke dataset (M1-smoke produces very
+# little data; the point is end-to-end plumbing, not learning quality).
+gate_min_retrieval_top5_fraction_of_baseline: 0.50
+gate_max_reconstruction_mse_ratio: 0.50
+
+identity_probe_warning_threshold: 0.10
+identity_probe_error_threshold: 0.01
+on_manifold_drift_warning_threshold: 5.0
+
+output_dir: ./outputs/projection
+checkpoint_dir: ./checkpoints/projection
+device: cuda
+dtype: float32

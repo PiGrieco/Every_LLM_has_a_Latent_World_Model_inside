@@ -17,16 +17,18 @@ git checkout v1-final   # reproduce v1 results exactly
 git checkout main       # current v2 work
 ```
 
-Current milestone: **M1 — LLM probing infrastructure**. See
-[`src/llm_probe/README.md`](src/llm_probe/README.md).
+Current milestone: **M2 — Projection Φ / Ψ with retrieval decoder**.
+See [`src/projection/README.md`](src/projection/README.md).
 
 ### v2 roadmap
 
 - [x] **M1** — LLM activation trajectories (Llama-3-8B, Wikipedia, fp16
-  shards, rigid smoke gate before proceeding).
-- [ ] **M2** — Projection Φ / Ψ with **retrieval-first** decoder
-  (nearest-neighbor in hidden-state memory). This proves the latent is
-  informative before we build a generative decoder.
+  shards, rigid smoke gate before proceeding). See
+  [`src/llm_probe/README.md`](src/llm_probe/README.md).
+- [x] **M2** — Projection Φ / Ψ with **retrieval-first** readout. Two
+  hard gates only (retrieval top-5 ratio, reconstruction MSE ratio);
+  identity probe and on-manifold drift are diagnostics. Adversarial
+  training is opt-in and off by default.
 - [ ] **M3** — Lorentzian metric with timelike + spacelike signals.
   **Suffix-decoder** here, not `LM_head(Ψ(s))` directly: pass `Ψ(s)`
   through remaining layers ℓ+1…L and the final norm before LM_head.

@@ -1,0 +1,77 @@
+# Full M2 projection run.
+# See src/projection/config.py for field-by-field documentation.
+# Expected compute: ~8-12h on one H100 for Stage A+B; Stage C adds ~2-3h.
+
+probe_data_dir: ./data/llm_probe
+forward_dataset: forward
+branching_dataset: branching
+
+# Latent dim — will be overridden if auto_adjust_dim and intrinsic_dim.json
+# exist.
+latent_dim: 64
+auto_adjust_dim: true
+intrinsic_dim_target_variance: 0.99
+intrinsic_dim_min: 32
+intrinsic_dim_max: 256
+intrinsic_dim_json: ./outputs/projection/intrinsic_dim.json
+
+# Encoder
+encoder_hidden: 512
+encoder_skip_proj: true
+encoder_dropout: 0.0
+
+# Decoder (symmetric)
+decoder_hidden: 512
+decoder_dropout: 0.0
+
+# Discriminator — opt-in; adversarial training is fragile by nature.
+use_adversarial: false
+discriminator_hidden: 256
+discriminator_layers: 5
+discriminator_dropout: 0.1
+
+# Training stages
+stage_a_epochs: 20
+stage_a_lr: 0.0003
+
+stage_b_epochs: 15
+stage_b_lr: 0.0001
+lambda_consistency: 0.5
+
+stage_c_epochs: 10
+stage_c_lr_g: 0.00005
+stage_c_lr_d: 0.0002
+lambda_adversarial: 0.1
+discriminator_steps_per_g: 2
+discriminator_gp_weight: 10.0
+
+# Dataloader
+batch_size: 512
+num_workers: 4
+train_split_fraction: 0.9
+random_seed: 42
+
+# Retrieval evaluation — disjoint memory/query doc-ids (60/40 split)
+retrieval_memory_size: 10000
+retrieval_queries: 2000
+retrieval_topk: [1, 5, 10, 50]
+memory_query_split_fraction: 0.6
+
+# Identity probe (diagnostic only)
+identity_probe_n_classes: 1000
+identity_probe_samples_per_class: 8
+identity_probe_epochs: 20
+
+# HARD gates — only two. These alone gate M3.
+gate_min_retrieval_top5_fraction_of_baseline: 0.80
+gate_max_reconstruction_mse_ratio: 0.05
+
+# DIAGNOSTICS (warn-only, NOT gated)
+identity_probe_warning_threshold: 0.20
+identity_probe_error_threshold: 0.05
+on_manifold_drift_warning_threshold: 2.0
+
+output_dir: ./outputs/projection
+checkpoint_dir: ./checkpoints/projection
+device: cuda
+dtype: float32
